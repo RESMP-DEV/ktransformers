@@ -75,6 +75,9 @@ class KTConfig:
     kt_lora_rank: int | None = None
     kt_lora_alpha: float | None = None
 
+    # Base-weight quantization format for expert weights (affects memory + kernel path)
+    kt_base_weight_format: str | None = None  # "BF16", "FP16", "MXFP4", or None (auto)
+
     # LoRA Experts (GPU-side extra experts)
     kt_use_lora_experts: bool | None = None
     kt_lora_expert_num: int | None = None
@@ -137,3 +140,5 @@ class KTConfig:
         if self.kt_skip_expert_loading is None:
             if "ACCELERATE_KT_SKIP_EXPERT_LOADING" in os.environ:
                 self.kt_skip_expert_loading = _env_bool("ACCELERATE_KT_SKIP_EXPERT_LOADING", True)
+        if self.kt_base_weight_format is None:
+            self.kt_base_weight_format = os.environ.get("ACCELERATE_KT_BASE_WEIGHT_FORMAT", None)
