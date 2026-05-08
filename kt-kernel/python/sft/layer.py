@@ -24,7 +24,7 @@ from .autograd import KTMoEFunction
 from .dist_utils import (
     _all_gather_qlens,
     _checkpoint_hook_mode,
-    _dist_gather_varlen_to_rank0,
+    _dist_gather_varlen_many_to_rank0,
     _dist_scatter_varlen_from_rank0,
     _qlen_offsets,
 )
@@ -312,26 +312,17 @@ class KTMoELayerWrapper(nn.Module):
             submit_ids = expert_ids.detach()
             submit_wts = weights.detach()
 
-            gathered_hs = _dist_gather_varlen_to_rank0(
-                submit_hs,
-                all_qlens=all_qlens,
-                rank=rank,
-                world_size=world_size,
-            )
-            gathered_ids = _dist_gather_varlen_to_rank0(
-                submit_ids,
-                all_qlens=all_qlens,
-                rank=rank,
-                world_size=world_size,
-            )
-            gathered_wts = _dist_gather_varlen_to_rank0(
-                submit_wts,
+            gathered = _dist_gather_varlen_many_to_rank0(
+                [submit_hs, submit_ids, submit_wts],
                 all_qlens=all_qlens,
                 rank=rank,
                 world_size=world_size,
             )
 
             if rank == 0:
+                if gathered is None:
+                    raise RuntimeError("Rank0 expected gathered tensors.")
+                gathered_hs, gathered_ids, gathered_wts = gathered
                 all_hs = torch.cat(gathered_hs, dim=0)
                 all_ids = torch.cat(gathered_ids, dim=0)
                 all_wts = torch.cat(gathered_wts, dim=0)

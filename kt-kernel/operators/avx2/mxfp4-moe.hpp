@@ -200,13 +200,17 @@ struct GemmKernelAVX2MXFP4DQ {
   };
 };
 
-static inline void mxfp4_fma_16(const ggml_bf16_t* a, const uint8_t* w, __m256 scale, __m256* acc) {
+static inline void mxfp4_fma_16_loaded(__m256 a0, __m256 a1, const uint8_t* w, __m256 scale, __m256* acc) {
   __m256 w0, w1;
   mxfp4x16_to_2xfp32(w, &w0, &w1);
   w0 = _mm256_mul_ps(w0, scale);
   w1 = _mm256_mul_ps(w1, scale);
-  *acc = _mm256_fmadd_ps(load_bf16_to_fp32(a), w0, *acc);
-  *acc = _mm256_fmadd_ps(load_bf16_to_fp32(a + 8), w1, *acc);
+  *acc = _mm256_fmadd_ps(a0, w0, *acc);
+  *acc = _mm256_fmadd_ps(a1, w1, *acc);
+}
+
+static inline void mxfp4_fma_16(const ggml_bf16_t* a, const uint8_t* w, __m256 scale, __m256* acc) {
+  mxfp4_fma_16_loaded(load_bf16_to_fp32(a), load_bf16_to_fp32(a + 8), w, scale, acc);
 }
 
 static inline float mxfp4_dot_scaled(const ggml_bf16_t* a_row, const uint8_t* b_row, const float* scales,
@@ -370,6 +374,134 @@ static inline void gemm_mxfp4(int m, int n, int k, GemmKernelAVX2MXFP4DQ::Buffer
   }
 }
 
+static inline void gemm_mxfp4_pair(int m, int n, int k, GemmKernelAVX2MXFP4::BufferA& a,
+                                   GemmKernelAVX2MXFP4::BufferB& gate_b, GemmKernelAVX2MXFP4::BufferB& up_b,
+                                   GemmKernelAVX2MXFP4::BufferC& gate_c, GemmKernelAVX2MXFP4::BufferC& up_c, int ith,
+                                   int nth) {
+  (void)k;
+  auto [n_start, n_end] = split_range(n, ith, nth);
+  const int group_size = gate_b.group_size;
+  const int num_groups = gate_b.num_groups;
+
+  for (int mi = 0; mi < m; ++mi) {
+    const ggml_bf16_t* a_row = a.data + (size_t)mi * a.k;
+    float* gate_c_row = gate_c.data + (size_t)mi * n;
+    float* up_c_row = up_c.data + (size_t)mi * n;
+    int ni = n_start;
+
+    for (; ni + 2 <= n_end; ni += 2) {
+      const uint8_t* gate_b0 = gate_b.b + (size_t)(ni + 0) * gate_b.row_bytes;
+      const uint8_t* gate_b1 = gate_b.b + (size_t)(ni + 1) * gate_b.row_bytes;
+      const uint8_t* up_b0 = up_b.b + (size_t)(ni + 0) * up_b.row_bytes;
+      const uint8_t* up_b1 = up_b.b + (size_t)(ni + 1) * up_b.row_bytes;
+      const float* gate_s0 = gate_b.d + (size_t)(ni + 0) * num_groups;
+      const float* gate_s1 = gate_b.d + (size_t)(ni + 1) * num_groups;
+      const float* up_s0 = up_b.d + (size_t)(ni + 0) * num_groups;
+      const float* up_s1 = up_b.d + (size_t)(ni + 1) * num_groups;
+
+      __m256 gate_acc0 = _mm256_setzero_ps();
+      __m256 gate_acc1 = _mm256_setzero_ps();
+      __m256 up_acc0 = _mm256_setzero_ps();
+      __m256 up_acc1 = _mm256_setzero_ps();
+
+      for (int g = 0; g < num_groups; ++g) {
+        const int k_base = g * group_size;
+        const __m256 gate_scale0 = _mm256_set1_ps(gate_s0[g]);
+        const __m256 gate_scale1 = _mm256_set1_ps(gate_s1[g]);
+        const __m256 up_scale0 = _mm256_set1_ps(up_s0[g]);
+        const __m256 up_scale1 = _mm256_set1_ps(up_s1[g]);
+        for (int kk = 0; kk < group_size; kk += 16) {
+          const int k_off = k_base + kk;
+          const __m256 a0 = load_bf16_to_fp32(a_row + k_off);
+          const __m256 a1 = load_bf16_to_fp32(a_row + k_off + 8);
+          mxfp4_fma_16_loaded(a0, a1, gate_b0 + k_off / 2, gate_scale0, &gate_acc0);
+          mxfp4_fma_16_loaded(a0, a1, gate_b1 + k_off / 2, gate_scale1, &gate_acc1);
+          mxfp4_fma_16_loaded(a0, a1, up_b0 + k_off / 2, up_scale0, &up_acc0);
+          mxfp4_fma_16_loaded(a0, a1, up_b1 + k_off / 2, up_scale1, &up_acc1);
+        }
+      }
+
+      gate_c_row[ni + 0] = hsum_avx2(gate_acc0);
+      gate_c_row[ni + 1] = hsum_avx2(gate_acc1);
+      up_c_row[ni + 0] = hsum_avx2(up_acc0);
+      up_c_row[ni + 1] = hsum_avx2(up_acc1);
+    }
+
+    for (; ni < n_end; ++ni) {
+      const uint8_t* gate_b_row = gate_b.b + (size_t)ni * gate_b.row_bytes;
+      const uint8_t* up_b_row = up_b.b + (size_t)ni * up_b.row_bytes;
+      const float* gate_scales = gate_b.d + (size_t)ni * num_groups;
+      const float* up_scales = up_b.d + (size_t)ni * num_groups;
+      gate_c_row[ni] = mxfp4_dot_scaled(a_row, gate_b_row, gate_scales, group_size, num_groups);
+      up_c_row[ni] = mxfp4_dot_scaled(a_row, up_b_row, up_scales, group_size, num_groups);
+    }
+  }
+}
+
+static inline void gemm_mxfp4_pair(int m, int n, int k, GemmKernelAVX2MXFP4DQ::BufferA& a,
+                                   GemmKernelAVX2MXFP4DQ::BufferB& gate_b, GemmKernelAVX2MXFP4DQ::BufferB& up_b,
+                                   GemmKernelAVX2MXFP4DQ::BufferC& gate_c, GemmKernelAVX2MXFP4DQ::BufferC& up_c,
+                                   int ith, int nth) {
+  (void)k;
+  auto [n_start, n_end] = split_range(n, ith, nth);
+  const int group_size = gate_b.group_size;
+  const int num_groups = gate_b.num_groups;
+
+  for (int mi = 0; mi < m; ++mi) {
+    const ggml_bf16_t* a_row = a.data + (size_t)mi * a.k;
+    float* gate_c_row = gate_c.data + (size_t)mi * n;
+    float* up_c_row = up_c.data + (size_t)mi * n;
+    int ni = n_start;
+
+    for (; ni + 2 <= n_end; ni += 2) {
+      const uint8_t* gate_b0 = gate_b.b + (size_t)(ni + 0) * gate_b.row_bytes;
+      const uint8_t* gate_b1 = gate_b.b + (size_t)(ni + 1) * gate_b.row_bytes;
+      const uint8_t* up_b0 = up_b.b + (size_t)(ni + 0) * up_b.row_bytes;
+      const uint8_t* up_b1 = up_b.b + (size_t)(ni + 1) * up_b.row_bytes;
+      const uint8_t* gate_s0 = gate_b.d + (size_t)(ni + 0) * num_groups;
+      const uint8_t* gate_s1 = gate_b.d + (size_t)(ni + 1) * num_groups;
+      const uint8_t* up_s0 = up_b.d + (size_t)(ni + 0) * num_groups;
+      const uint8_t* up_s1 = up_b.d + (size_t)(ni + 1) * num_groups;
+
+      __m256 gate_acc0 = _mm256_setzero_ps();
+      __m256 gate_acc1 = _mm256_setzero_ps();
+      __m256 up_acc0 = _mm256_setzero_ps();
+      __m256 up_acc1 = _mm256_setzero_ps();
+
+      for (int g = 0; g < num_groups; ++g) {
+        const int k_base = g * group_size;
+        const __m256 gate_scale0 = ue8m0_scale_to_m256(gate_s0[g]);
+        const __m256 gate_scale1 = ue8m0_scale_to_m256(gate_s1[g]);
+        const __m256 up_scale0 = ue8m0_scale_to_m256(up_s0[g]);
+        const __m256 up_scale1 = ue8m0_scale_to_m256(up_s1[g]);
+        for (int kk = 0; kk < group_size; kk += 16) {
+          const int k_off = k_base + kk;
+          const __m256 a0 = load_bf16_to_fp32(a_row + k_off);
+          const __m256 a1 = load_bf16_to_fp32(a_row + k_off + 8);
+          mxfp4_fma_16_loaded(a0, a1, gate_b0 + k_off / 2, gate_scale0, &gate_acc0);
+          mxfp4_fma_16_loaded(a0, a1, gate_b1 + k_off / 2, gate_scale1, &gate_acc1);
+          mxfp4_fma_16_loaded(a0, a1, up_b0 + k_off / 2, up_scale0, &up_acc0);
+          mxfp4_fma_16_loaded(a0, a1, up_b1 + k_off / 2, up_scale1, &up_acc1);
+        }
+      }
+
+      gate_c_row[ni + 0] = hsum_avx2(gate_acc0);
+      gate_c_row[ni + 1] = hsum_avx2(gate_acc1);
+      up_c_row[ni + 0] = hsum_avx2(up_acc0);
+      up_c_row[ni + 1] = hsum_avx2(up_acc1);
+    }
+
+    for (; ni < n_end; ++ni) {
+      const uint8_t* gate_b_row = gate_b.b + (size_t)ni * gate_b.row_bytes;
+      const uint8_t* up_b_row = up_b.b + (size_t)ni * up_b.row_bytes;
+      const uint8_t* gate_scales = gate_b.d + (size_t)ni * num_groups;
+      const uint8_t* up_scales = up_b.d + (size_t)ni * num_groups;
+      gate_c_row[ni] = mxfp4_dot_scaled_ue8m0(a_row, gate_b_row, gate_scales, group_size, num_groups);
+      up_c_row[ni] = mxfp4_dot_scaled_ue8m0(a_row, up_b_row, up_scales, group_size, num_groups);
+    }
+  }
+}
+
 }  // namespace avx2
 
 template <class T = avx2::GemmKernelAVX2MXFP4>
@@ -427,6 +559,14 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
     auto& bb = do_up ? up_bb_[expert_idx] : gate_bb_[expert_idx];
     auto& bc = do_up ? up_bc_[expert_idx] : gate_bc_[expert_idx];
     avx2::gemm_mxfp4(m, config_.intermediate_size, config_.hidden_size, *ba, *bb, *bc, ith, nth);
+  }
+
+  void do_gate_up_gemm_pair(int expert_idx, int ith, int nth, int qlen) {
+    (void)qlen;
+    int m = m_local_num_[expert_idx];
+    avx2::gemm_mxfp4_pair(m, config_.intermediate_size, config_.hidden_size, *gate_up_ba_[expert_idx],
+                          *gate_bb_[expert_idx], *up_bb_[expert_idx], *gate_bc_[expert_idx], *up_bc_[expert_idx], ith,
+                          nth);
   }
 
   void do_down_gemm(int expert_idx, int ith, int nth, int qlen) {

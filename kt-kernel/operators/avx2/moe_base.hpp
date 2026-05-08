@@ -266,21 +266,34 @@ class AVX2_MOE_BASE {
 
     // Gate + Up GEMM
     int nth = T::recommended_nth(config_.intermediate_size);
-    pool->do_work_stealing_job(
-        nth * activated_expert * 2, [](int) { T::config(); },
-        [this, nth, qlen](int task_id2) {
-          int task_id = task_id2 / 2;
-          bool do_up = task_id2 % 2;
-          int expert_idx = m_expert_id_map_[task_id / nth];
-          int ith = task_id % nth;
-          derived()->do_gate_up_gemm(do_up, expert_idx, ith, nth, qlen);
-          if (do_up) {
-            up_bc_[expert_idx]->to_mat(m_local_num_[expert_idx], m_local_up_output_ptr_[expert_idx], ith, nth);
-          } else {
+    if constexpr (requires(Derived* d) { d->do_gate_up_gemm_pair(0, 0, 0, 0); }) {
+      pool->do_work_stealing_job(
+          nth * activated_expert, [](int) { T::config(); },
+          [this, nth, qlen](int task_id) {
+            int expert_idx = m_expert_id_map_[task_id / nth];
+            int ith = task_id % nth;
+            derived()->do_gate_up_gemm_pair(expert_idx, ith, nth, qlen);
             gate_bc_[expert_idx]->to_mat(m_local_num_[expert_idx], m_local_gate_output_ptr_[expert_idx], ith, nth);
-          }
-        },
-        nullptr);
+            up_bc_[expert_idx]->to_mat(m_local_num_[expert_idx], m_local_up_output_ptr_[expert_idx], ith, nth);
+          },
+          nullptr);
+    } else {
+      pool->do_work_stealing_job(
+          nth * activated_expert * 2, [](int) { T::config(); },
+          [this, nth, qlen](int task_id2) {
+            int task_id = task_id2 / 2;
+            bool do_up = task_id2 % 2;
+            int expert_idx = m_expert_id_map_[task_id / nth];
+            int ith = task_id % nth;
+            derived()->do_gate_up_gemm(do_up, expert_idx, ith, nth, qlen);
+            if (do_up) {
+              up_bc_[expert_idx]->to_mat(m_local_num_[expert_idx], m_local_up_output_ptr_[expert_idx], ith, nth);
+            } else {
+              gate_bc_[expert_idx]->to_mat(m_local_num_[expert_idx], m_local_gate_output_ptr_[expert_idx], ith, nth);
+            }
+          },
+          nullptr);
+    }
 
     // Activation: SiLU(gate) * up — AVX2 version (8 elements at a time)
     apply_activation(activated_expert, nth, qlen);
@@ -397,21 +410,34 @@ class AVX2_MOE_BASE {
 
     // Gate + Up GEMM
     int nth = T::recommended_nth(config_.intermediate_size);
-    pool->do_work_stealing_job(
-        nth * activated_expert * 2, [](int) { T::config(); },
-        [this, nth, qlen](int task_id2) {
-          int task_id = task_id2 / 2;
-          bool do_up = task_id2 % 2;
-          int expert_idx = m_expert_id_map_[task_id / nth];
-          int ith = task_id % nth;
-          derived()->do_gate_up_gemm(do_up, expert_idx, ith, nth, qlen);
-          if (do_up) {
-            up_bc_[expert_idx]->to_mat(qlen, m_local_up_output_ptr_[expert_idx], ith, nth);
-          } else {
+    if constexpr (requires(Derived* d) { d->do_gate_up_gemm_pair(0, 0, 0, 0); }) {
+      pool->do_work_stealing_job(
+          nth * activated_expert, [](int) { T::config(); },
+          [this, nth, qlen](int task_id) {
+            int expert_idx = m_expert_id_map_[task_id / nth];
+            int ith = task_id % nth;
+            derived()->do_gate_up_gemm_pair(expert_idx, ith, nth, qlen);
             gate_bc_[expert_idx]->to_mat(qlen, m_local_gate_output_ptr_[expert_idx], ith, nth);
-          }
-        },
-        nullptr);
+            up_bc_[expert_idx]->to_mat(qlen, m_local_up_output_ptr_[expert_idx], ith, nth);
+          },
+          nullptr);
+    } else {
+      pool->do_work_stealing_job(
+          nth * activated_expert * 2, [](int) { T::config(); },
+          [this, nth, qlen](int task_id2) {
+            int task_id = task_id2 / 2;
+            bool do_up = task_id2 % 2;
+            int expert_idx = m_expert_id_map_[task_id / nth];
+            int ith = task_id % nth;
+            derived()->do_gate_up_gemm(do_up, expert_idx, ith, nth, qlen);
+            if (do_up) {
+              up_bc_[expert_idx]->to_mat(qlen, m_local_up_output_ptr_[expert_idx], ith, nth);
+            } else {
+              gate_bc_[expert_idx]->to_mat(qlen, m_local_gate_output_ptr_[expert_idx], ith, nth);
+            }
+          },
+          nullptr);
+    }
 
     // Activation
     apply_activation(activated_expert, nth, qlen);

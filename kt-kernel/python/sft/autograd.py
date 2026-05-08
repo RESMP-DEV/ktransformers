@@ -13,6 +13,7 @@ from .dist_utils import (
     _all_gather_qlens,
     _qlen_offsets,
     _dist_gather_varlen_to_rank0,
+    _dist_scatter_varlen_many_from_rank0,
     _dist_scatter_varlen_from_rank0,
 )
 
@@ -204,23 +205,14 @@ class KTMoEFunction(torch.autograd.Function):
                 scatter_gi = None
                 scatter_gw = None
 
-            grad_input_flat = _dist_scatter_varlen_from_rank0(
-                rank0_chunks=scatter_gi,
+            grad_input_flat, grad_weights_flat = _dist_scatter_varlen_many_from_rank0(
+                rank0_chunks_per_tensor=None if scatter_gi is None or scatter_gw is None else [scatter_gi, scatter_gw],
                 all_qlens=all_qlens,
                 rank=rank,
                 world_size=world_size,
-                feature_shape=(hidden_size,),
-                device=ctx.original_device,
-                dtype=ctx.original_dtype,
-            )
-            grad_weights_flat = _dist_scatter_varlen_from_rank0(
-                rank0_chunks=scatter_gw,
-                all_qlens=all_qlens,
-                rank=rank,
-                world_size=world_size,
-                feature_shape=(num_experts_per_tok,),
-                device=ctx.weights_device,
-                dtype=torch.bfloat16,
+                feature_shapes=[(hidden_size,), (num_experts_per_tok,)],
+                devices=[ctx.original_device, ctx.weights_device],
+                dtypes=[ctx.original_dtype, torch.bfloat16],
             )
             grad_input = grad_input_flat.view(batch_size, seq_len, hidden_size)
             grad_weights = grad_weights_flat.view(ctx.weights_shape).to(dtype=ctx.weights_dtype)
