@@ -19,6 +19,9 @@ and this project adheres to semantic versioning principles.
 
 ### Changed
 - `cuda/binding.cpp`: Added MXFP4 module include and binding
+- AVX2 MXFP4 MoE gate/up projection can run as a paired kernel, sharing input
+  BF16 loads across gate and up row-dot work, while KT-SFT distributed backward
+  now scatters grad-input and router-weight gradients in one rank0 exchange.
 - AVX2 MXFP4 DQ scale conversion now uses small UE8M0 lookup tables for FP32
   and BF16 bit patterns instead of recomputing the bit shifts at each use.
 
