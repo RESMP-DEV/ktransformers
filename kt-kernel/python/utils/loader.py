@@ -504,6 +504,77 @@ class FP8SafeTensorLoader(SafeTensorLoader):
         return self._is_per_channel
 
 
+class MXFP4SafeTensorLoader(SafeTensorLoader):
+    """Loader for native MXFP4 expert weights.
+
+    Expected DeepSeek-V4-style per-expert keys:
+      {base}.ffn.experts.{i}.w1.weight / .scale  (gate)
+      {base}.ffn.experts.{i}.w3.weight / .scale  (up)
+      {base}.ffn.experts.{i}.w2.weight / .scale  (down)
+
+    Weights are E2M1 nibble-packed uint8 tensors. Scales are ue8m0 bytes in
+    the checkpoint and are losslessly represented as bf16 for the C++ backend.
+    """
+
+    EXPERTS_PATH_TPL = "{base}.ffn.experts"
+    PROJ_NAMES = ("w1", "w3", "w2")
+
+    def _experts_prefix_candidates(self, base_key: str) -> list[str]:
+        candidates = [self.EXPERTS_PATH_TPL.format(base=base_key)]
+        if base_key.startswith("model."):
+            candidates.append(self.EXPERTS_PATH_TPL.format(base=base_key[len("model.") :]))
+        return list(dict.fromkeys(candidates))
+
+    @staticmethod
+    def _ue8m0_to_bf16(scale_t: torch.Tensor) -> torch.Tensor:
+        if scale_t.dtype != torch.uint8:
+            scale_t = scale_t.view(torch.uint8)
+        scale_i32 = scale_t.to(torch.int32)
+        scale_i32 = torch.where(scale_i32 == 255, torch.zeros_like(scale_i32), scale_i32)
+        return (scale_i32 << 7).to(torch.int16).view(torch.bfloat16).contiguous()
+
+    def load_experts(self, base_key: str, device: str = "cpu"):
+        experts_prefix = None
+        expert_count = 0
+        for prefix in self._experts_prefix_candidates(base_key):
+            expert_count = 0
+            while self.has_tensor(f"{prefix}.{expert_count}.w1.weight"):
+                expert_count += 1
+            if expert_count > 0:
+                experts_prefix = prefix
+                break
+
+        if experts_prefix is None:
+            raise ValueError(f"No MXFP4 experts found for keys: {self._experts_prefix_candidates(base_key)}")
+
+        gate_weights = [None] * expert_count
+        up_weights = [None] * expert_count
+        down_weights = [None] * expert_count
+        gate_scales = [None] * expert_count
+        up_scales = [None] * expert_count
+        down_scales = [None] * expert_count
+
+        for exp_id in range(expert_count):
+            for proj_name, dst in (("w1", gate_weights), ("w3", up_weights), ("w2", down_weights)):
+                w = self.load_tensor(f"{experts_prefix}.{exp_id}.{proj_name}.weight", device)
+                if w.dtype != torch.uint8:
+                    w = w.view(torch.uint8)
+                dst[exp_id] = w.contiguous()
+
+            for proj_name, dst in (("w1", gate_scales), ("w3", up_scales), ("w2", down_scales)):
+                s = self.load_tensor(f"{experts_prefix}.{exp_id}.{proj_name}.scale", device)
+                dst[exp_id] = self._ue8m0_to_bf16(s)
+
+        return {
+            "gate": gate_weights,
+            "up": up_weights,
+            "down": down_weights,
+            "gate_scale": gate_scales,
+            "up_scale": up_scales,
+            "down_scale": down_scales,
+        }
+
+
 class BF16SafeTensorLoader(SafeTensorLoader):
     """Loader for native BF16 expert weights (no quantization, no scales).
 
