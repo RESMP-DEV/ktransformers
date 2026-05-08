@@ -221,6 +221,7 @@ struct GeneralMLAConfig {
 
 struct QuantConfig {
   std::string quant_method = "";
+  std::string scale_format = "";
   int bits = 0;
   int group_size = 0;
   bool zero_point = false;

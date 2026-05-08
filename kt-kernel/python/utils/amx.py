@@ -26,6 +26,7 @@ AVX2BF16_MOE = getattr(_moe_mod, "AVX2BF16_MOE", None)
 AVX2FP8_MOE = getattr(_moe_mod, "AVX2FP8_MOE", None)
 AVX2GPTQInt4_MOE = getattr(_moe_mod, "AVX2GPTQInt4_MOE", None)
 AVX2MXFP4_MOE = getattr(_moe_mod, "AVX2MXFP4_MOE", None)
+AVX2MXFP4_DQ_MOE = getattr(_moe_mod, "AVX2MXFP4_DQ_MOE", None)
 AVXVNNI256GPTQInt4_MOE = getattr(_moe_mod, "AVXVNNI256GPTQInt4_MOE", None)
 
 _HAS_AMXINT4_SUPPORT = AMXInt4_MOE is not None
@@ -38,6 +39,7 @@ _HAS_AVX2_BF16_SUPPORT = AVX2BF16_MOE is not None
 _HAS_AVX2_FP8_SUPPORT = AVX2FP8_MOE is not None
 _HAS_AVX2_GPTQ_INT4_SUPPORT = AVX2GPTQInt4_MOE is not None
 _HAS_AVX2_MXFP4_SUPPORT = AVX2MXFP4_MOE is not None
+_HAS_AVX2_MXFP4_DQ_SUPPORT = AVX2MXFP4_DQ_MOE is not None
 _HAS_AVXVNNI256_GPTQ_INT4_SUPPORT = AVXVNNI256GPTQInt4_MOE is not None
 _AVXVNNI256_GPTQ_INT4_MAX_GROUP_SIZE = 256
 
@@ -453,6 +455,12 @@ class NativeMoEWrapper(BaseMoEWrapper):
                 "  - AVX2 + FMA\n"
                 "Please recompile kt_kernel_ext with AVX2 enabled."
             )
+        if method == "MXFP4_DQ" and not _HAS_AVX2_MXFP4_DQ_SUPPORT:
+            raise RuntimeError(
+                "MXFP4_DQ backend not available. Required ISA:\n"
+                "  - AVX2 + FMA\n"
+                "Please recompile kt_kernel_ext with AVX2 enabled."
+            )
 
         super().__init__(
             layer_idx=layer_idx,
@@ -485,6 +493,8 @@ class NativeMoEWrapper(BaseMoEWrapper):
                 NativeMoEWrapper._native_loader_instance = GPTQSafeTensorLoader(weight_path)
             elif method == "MXFP4":
                 NativeMoEWrapper._native_loader_instance = MXFP4SafeTensorLoader(weight_path)
+            elif method == "MXFP4_DQ":
+                NativeMoEWrapper._native_loader_instance = MXFP4SafeTensorLoader(weight_path, scale_format="ue8m0")
             else:
                 raise NotImplementedError(f"Unsupported method for NativeMoEWrapper: {method}")
         self.loader = NativeMoEWrapper._native_loader_instance
@@ -554,6 +564,8 @@ class NativeMoEWrapper(BaseMoEWrapper):
                 assert self.gate_scales[0].dtype == torch.float32, "Expected float32 scales for FP8_PERCHANNEL"
             elif self.method == "MXFP4":
                 assert self.gate_scales[0].dtype == torch.bfloat16, "Expected bf16 scales for MXFP4"
+            elif self.method == "MXFP4_DQ":
+                assert self.gate_scales[0].dtype == torch.uint8, "Expected ue8m0 uint8 scales for MXFP4_DQ"
 
         t2 = time.time()
 
@@ -638,6 +650,13 @@ class NativeMoEWrapper(BaseMoEWrapper):
             moe_config.quant_config.group_size = group_size
             moe_config.quant_config.zero_point = False
             self.moe = AVX2MXFP4_MOE(moe_config)
+        elif self.method == "MXFP4_DQ":
+            group_size = self.hidden_size // self.gate_scales[0].shape[1]
+            moe_config.quant_config.bits = 4
+            moe_config.quant_config.group_size = group_size
+            moe_config.quant_config.zero_point = False
+            moe_config.quant_config.scale_format = "ue8m0"
+            self.moe = AVX2MXFP4_DQ_MOE(moe_config)
         elif self.method == "BF16":
             # BF16 has no quantization config needed
             # Prefer AMX backend, fall back to AVX2

@@ -40,7 +40,8 @@ INFERENCE_METHODS = frozenset(
         "BF16",  # BF16 native MoE
         "FP8_PERCHANNEL",  # Per-channel FP8
         "GPTQ_INT4",  # GPTQ INT4
-        "MXFP4",  # MXFP4 E2M1 packed weights + ue8m0/bf16 group scales
+        "MXFP4",  # MXFP4 E2M1 packed weights + expanded bf16 group scales
+        "MXFP4_DQ",  # MXFP4 E2M1 packed weights + native ue8m0 group scales
         "LLAMAFILE",  # GGUF format
         "MOE_INT4",
         "MOE_INT8",  # General kernel
@@ -313,7 +314,7 @@ def _create_inference_wrapper(
     # Select backend based on method
     if method in ["AMXINT4", "AMXINT8"]:
         backend_cls = AMXMoEWrapper
-    elif method in ["RAWINT4", "FP8", "BF16", "FP8_PERCHANNEL", "GPTQ_INT4", "MXFP4"]:
+    elif method in ["RAWINT4", "FP8", "BF16", "FP8_PERCHANNEL", "GPTQ_INT4", "MXFP4", "MXFP4_DQ"]:
         backend_cls = NativeMoEWrapper
     elif method == "LLAMAFILE":
         backend_cls = LlamafileMoEWrapper

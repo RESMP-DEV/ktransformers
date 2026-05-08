@@ -10,6 +10,7 @@
 #ifdef KTRANSFORMERS_USE_CUDA
 #include "gptq_marlin/ops.h"
 #include "moe/ops.h"
+#include "mxfp4/ops.h"
 #endif
 // Python bindings
 #include <pybind11/pybind11.h>
@@ -96,5 +97,16 @@ PYBIND11_MODULE(KTransformersOps, m) {
         py::arg("num_bits"), py::arg("size_m"), py::arg("size_n"), py::arg("size_k"), py::arg("is_k_full"));
   m.def("topk_softmax", &topk_softmax, "Function to perform topk_softmax.", py::arg("topk_weights"),
         py::arg("topk_indices"), py::arg("token_expert_indices"), py::arg("gating_output"));
+
+  /* MXFP4 dequantization binding */
+  m.def(
+      "dequantize_mxfp4",
+      [](const intptr_t data, int num_bytes, int blk_size, const int ele_per_blk, torch::Device device,
+         py::object target_dtype) {
+        torch::Dtype dtype = torch::python::detail::py_object_to_dtype(target_dtype);
+        return dequantize_mxfp4((int8_t*)data, num_bytes, blk_size, ele_per_blk, device, dtype);
+      },
+      "Function to dequantize MXFP4 (micro-scale float4) data.", py::arg("data"), py::arg("num_bytes"),
+      py::arg("blk_size"), py::arg("ele_per_blk"), py::arg("device"), py::arg("target_dtype"));
 #endif
 }

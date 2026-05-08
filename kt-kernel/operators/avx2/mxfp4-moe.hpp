@@ -35,10 +35,11 @@ namespace avx2 {
 struct GemmKernelAVX2MXFP4 {
   using dt = uint8_t;
   using output_t = float;
+  using source_scale_t = ggml_bf16_t;
   static constexpr int M_STEP = 1;
   static constexpr int N_STEP = 4;
   static constexpr int K_STEP = 16;
-  static constexpr int N_BLOCK = 128;
+  static constexpr int N_BLOCK = 256;
   static constexpr int K_BLOCK = 32;
   static constexpr double ELEMENT_SIZE = 0.5;
 
@@ -138,6 +139,66 @@ struct GemmKernelAVX2MXFP4 {
   };
 };
 
+struct GemmKernelAVX2MXFP4DQ {
+  using dt = uint8_t;
+  using output_t = float;
+  using source_scale_t = uint8_t;
+  using BufferA = GemmKernelAVX2MXFP4::BufferA;
+  using BufferC = GemmKernelAVX2MXFP4::BufferC;
+  static constexpr int M_STEP = GemmKernelAVX2MXFP4::M_STEP;
+  static constexpr int N_STEP = GemmKernelAVX2MXFP4::N_STEP;
+  static constexpr int K_STEP = GemmKernelAVX2MXFP4::K_STEP;
+  static constexpr int N_BLOCK = GemmKernelAVX2MXFP4::N_BLOCK;
+  static constexpr int K_BLOCK = GemmKernelAVX2MXFP4::K_BLOCK;
+  static constexpr double ELEMENT_SIZE = 0.5;
+
+  static void config() {}
+
+  static int recommended_nth(int n) { return GemmKernelAVX2MXFP4::recommended_nth(n); }
+
+  static std::pair<int, int> split_range_n(int n, int ith, int nth) {
+    return GemmKernelAVX2MXFP4::split_range_n(n, ith, nth);
+  }
+
+  struct BufferB {
+    uint8_t* b = nullptr;
+    uint8_t* d = nullptr;
+    int n = 0;
+    int k = 0;
+    int row_bytes = 0;
+    int group_size = 32;
+    int num_groups = 0;
+
+    BufferB() = default;
+    BufferB(size_t n_, size_t k_, int gs, void* ptr) : n((int)n_), k((int)k_), group_size(gs) {
+      if (group_size <= 0 || (group_size % 16) != 0) {
+        throw std::runtime_error("AVX2 MXFP4 DQ requires group_size to be a positive multiple of 16");
+      }
+      if ((k % 2) != 0 || (k % group_size) != 0) {
+        throw std::runtime_error("AVX2 MXFP4 DQ requires K to be divisible by 2 and group_size");
+      }
+      row_bytes = k / 2;
+      num_groups = k / group_size;
+      b = (uint8_t*)ptr;
+      d = (uint8_t*)ptr + (size_t)n * row_bytes;
+    }
+
+    static size_t required_size(size_t n, size_t k, int gs) {
+      if (gs <= 0) return 0;
+      return n * (k / 2) + n * (k / gs);
+    }
+
+    void from_mat(const uint8_t* src_weights, const uint8_t* src_scales, int ith, int nth) {
+      auto [n_start, n_end] = split_range(n, ith, nth);
+      if (n_start >= n_end) return;
+      std::memcpy(b + (size_t)n_start * row_bytes, src_weights + (size_t)n_start * row_bytes,
+                  (size_t)(n_end - n_start) * row_bytes);
+      std::memcpy(d + (size_t)n_start * num_groups, src_scales + (size_t)n_start * num_groups,
+                  (size_t)(n_end - n_start) * num_groups);
+    }
+  };
+};
+
 static inline void mxfp4_fma_16(const ggml_bf16_t* a, const uint8_t* w, __m256 scale, __m256* acc) {
   __m256 w0, w1;
   mxfp4x16_to_2xfp32(w, &w0, &w1);
@@ -153,6 +214,30 @@ static inline float mxfp4_dot_scaled(const ggml_bf16_t* a_row, const uint8_t* b_
   for (int g = 0; g < num_groups; ++g) {
     const int k_base = g * group_size;
     const __m256 scale = _mm256_set1_ps(scales[g]);
+    for (int kk = 0; kk < group_size; kk += 16) {
+      mxfp4_fma_16(a_row + k_base + kk, b_row + (k_base + kk) / 2, scale, &acc);
+    }
+  }
+  return hsum_avx2(acc);
+}
+
+static inline __m256 ue8m0_scale_to_m256(uint8_t raw) {
+  const uint32_t bits = (raw == 0 || raw == 255) ? 0 : ((uint32_t)raw << 23);
+  return _mm256_castsi256_ps(_mm256_set1_epi32((int)bits));
+}
+
+static inline ggml_bf16_t ue8m0_scale_to_bf16(uint8_t raw) {
+  ggml_bf16_t out;
+  out.bits = (raw == 0 || raw == 255) ? 0 : (uint16_t)raw << 7;
+  return out;
+}
+
+static inline float mxfp4_dot_scaled_ue8m0(const ggml_bf16_t* a_row, const uint8_t* b_row, const uint8_t* scales,
+                                           int group_size, int num_groups) {
+  __m256 acc = _mm256_setzero_ps();
+  for (int g = 0; g < num_groups; ++g) {
+    const int k_base = g * group_size;
+    const __m256 scale = ue8m0_scale_to_m256(scales[g]);
     for (int kk = 0; kk < group_size; kk += 16) {
       mxfp4_fma_16(a_row + k_base + kk, b_row + (k_base + kk) / 2, scale, &acc);
     }
@@ -212,6 +297,63 @@ static inline void gemm_mxfp4(int m, int n, int k, GemmKernelAVX2MXFP4::BufferA&
       const uint8_t* b_row = b.b + (size_t)ni * b.row_bytes;
       const float* scales = b.d + (size_t)ni * num_groups;
       c_row[ni] = mxfp4_dot_scaled(a_row, b_row, scales, group_size, num_groups);
+    }
+  }
+}
+
+static inline void gemm_mxfp4(int m, int n, int k, GemmKernelAVX2MXFP4DQ::BufferA& a,
+                              GemmKernelAVX2MXFP4DQ::BufferB& b, GemmKernelAVX2MXFP4DQ::BufferC& c, int ith,
+                              int nth) {
+  (void)k;
+  auto [n_start, n_end] = split_range(n, ith, nth);
+  const int group_size = b.group_size;
+  const int num_groups = b.num_groups;
+
+  for (int mi = 0; mi < m; ++mi) {
+    const ggml_bf16_t* a_row = a.data + (size_t)mi * a.k;
+    float* c_row = c.data + (size_t)mi * n;
+    int ni = n_start;
+
+    for (; ni + 4 <= n_end; ni += 4) {
+      const uint8_t* b0 = b.b + (size_t)(ni + 0) * b.row_bytes;
+      const uint8_t* b1 = b.b + (size_t)(ni + 1) * b.row_bytes;
+      const uint8_t* b2 = b.b + (size_t)(ni + 2) * b.row_bytes;
+      const uint8_t* b3 = b.b + (size_t)(ni + 3) * b.row_bytes;
+      const uint8_t* s0 = b.d + (size_t)(ni + 0) * num_groups;
+      const uint8_t* s1 = b.d + (size_t)(ni + 1) * num_groups;
+      const uint8_t* s2 = b.d + (size_t)(ni + 2) * num_groups;
+      const uint8_t* s3 = b.d + (size_t)(ni + 3) * num_groups;
+
+      __m256 acc0 = _mm256_setzero_ps();
+      __m256 acc1 = _mm256_setzero_ps();
+      __m256 acc2 = _mm256_setzero_ps();
+      __m256 acc3 = _mm256_setzero_ps();
+
+      for (int g = 0; g < num_groups; ++g) {
+        const int k_base = g * group_size;
+        const __m256 scale0 = ue8m0_scale_to_m256(s0[g]);
+        const __m256 scale1 = ue8m0_scale_to_m256(s1[g]);
+        const __m256 scale2 = ue8m0_scale_to_m256(s2[g]);
+        const __m256 scale3 = ue8m0_scale_to_m256(s3[g]);
+        for (int kk = 0; kk < group_size; kk += 16) {
+          const int k_off = k_base + kk;
+          mxfp4_fma_16(a_row + k_off, b0 + k_off / 2, scale0, &acc0);
+          mxfp4_fma_16(a_row + k_off, b1 + k_off / 2, scale1, &acc1);
+          mxfp4_fma_16(a_row + k_off, b2 + k_off / 2, scale2, &acc2);
+          mxfp4_fma_16(a_row + k_off, b3 + k_off / 2, scale3, &acc3);
+        }
+      }
+
+      c_row[ni + 0] = hsum_avx2(acc0);
+      c_row[ni + 1] = hsum_avx2(acc1);
+      c_row[ni + 2] = hsum_avx2(acc2);
+      c_row[ni + 3] = hsum_avx2(acc3);
+    }
+
+    for (; ni < n_end; ++ni) {
+      const uint8_t* b_row = b.b + (size_t)ni * b.row_bytes;
+      const uint8_t* scales = b.d + (size_t)ni * num_groups;
+      c_row[ni] = mxfp4_dot_scaled_ue8m0(a_row, b_row, scales, group_size, num_groups);
     }
   }
 }
@@ -283,6 +425,7 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
   }
 
   void load_weights() {
+    using scale_t = typename T::source_scale_t;
     auto& quant_config = config_.quant_config;
     const uint64_t* physical_to_logical_map = (const uint64_t*)config_.physical_to_logical_map;
     auto pool = config_.pool->get_subpool(tp_part_idx);
@@ -308,10 +451,9 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
           int ith = task_id % nth;
 
           gate_bb_[expert_idx]->from_mat((uint8_t*)config_.gate_proj + logical_expert_id * weight_bytes,
-                                         (ggml_bf16_t*)config_.gate_scale + logical_expert_id * scale_elems, ith,
-                                         nth);
+                                         (scale_t*)config_.gate_scale + logical_expert_id * scale_elems, ith, nth);
           up_bb_[expert_idx]->from_mat((uint8_t*)config_.up_proj + logical_expert_id * weight_bytes,
-                                       (ggml_bf16_t*)config_.up_scale + logical_expert_id * scale_elems, ith, nth);
+                                       (scale_t*)config_.up_scale + logical_expert_id * scale_elems, ith, nth);
         },
         nullptr);
 
@@ -324,8 +466,7 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
           int ith = task_id % nth;
 
           down_bb_[expert_idx]->from_mat((uint8_t*)config_.down_proj + logical_expert_id * weight_bytes,
-                                         (ggml_bf16_t*)config_.down_scale + logical_expert_id * scale_elems, ith,
-                                         nth);
+                                         (scale_t*)config_.down_scale + logical_expert_id * scale_elems, ith, nth);
         },
         nullptr);
   }
@@ -347,6 +488,15 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
       avx2::store_fp32_to_bf16(dst + i, _mm256_loadu_ps(src + i));
     }
     for (; i < count; ++i) dst[i] = GGML_FP32_TO_BF16(src[i]);
+  }
+
+  static inline void fast_scale_to_bf16(ggml_bf16_t* __restrict dst, const float* __restrict src, size_t count) {
+    fast_fp32_to_bf16(dst, src, count);
+  }
+
+  static inline void fast_scale_to_bf16(ggml_bf16_t* __restrict dst, const uint8_t* __restrict src, size_t count) {
+    size_t i = 0;
+    for (; i < count; ++i) dst[i] = avx2::ue8m0_scale_to_bf16(src[i]);
   }
 
   void write_weights_to_buffer(int gpu_tp_count, int cpu_tp_count, int expert_id, const GeneralMOEConfig& full_config,
@@ -416,14 +566,14 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
               for (size_t col = col_start; col < col_end; ++col) {
                 fast_memcpy(w2_weight_dst + col * gpu_weight_stride + gpu_weight_slice_offset,
                             down_bb_[expert_id]->b + col * weight_per_col, weight_per_col);
-                fast_fp32_to_bf16(w2_scale_dst + col * gpu_scale_stride + gpu_scale_slice_offset,
-                                  down_bb_[expert_id]->d + col * scale_per_col, scale_per_col);
+                fast_scale_to_bf16(w2_scale_dst + col * gpu_scale_stride + gpu_scale_slice_offset,
+                                   down_bb_[expert_id]->d + col * scale_per_col, scale_per_col);
               }
             } else if (task_id == NUM_WEIGHT_TASKS * 2 + num_down_tasks) {
-              fast_fp32_to_bf16(w13_scale_dst + offset_in_gpu_scale, gate_bb_[expert_id]->d, cpu_tp_scale_elem_count);
+              fast_scale_to_bf16(w13_scale_dst + offset_in_gpu_scale, gate_bb_[expert_id]->d, cpu_tp_scale_elem_count);
             } else {
-              fast_fp32_to_bf16(w13_scale_dst + offset_in_gpu_scale + gpu_tp_scale_elem_count, up_bb_[expert_id]->d,
-                                cpu_tp_scale_elem_count);
+              fast_scale_to_bf16(w13_scale_dst + offset_in_gpu_scale + gpu_tp_scale_elem_count, up_bb_[expert_id]->d,
+                                 cpu_tp_scale_elem_count);
             }
           },
           nullptr);
@@ -483,14 +633,14 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
                                           (size_t)local_gpu_idx * data_per_gpu_tp_scale / config_.hidden_size;
                 fast_memcpy(w2_weight_dst + col * weight_per_gpu_col, down_bb_[expert_id]->b + col_offset_weight,
                             weight_per_gpu_col);
-                fast_fp32_to_bf16(w2_scale_dst + col * scale_per_gpu_col, down_bb_[expert_id]->d + col_offset_scale,
-                                  scale_per_gpu_col);
+                fast_scale_to_bf16(w2_scale_dst + col * scale_per_gpu_col, down_bb_[expert_id]->d + col_offset_scale,
+                                   scale_per_gpu_col);
               }
             } else if (task_type == NUM_WEIGHT_TASKS * 2 + num_down_tasks) {
-              fast_fp32_to_bf16(w13_scale_dst, gate_bb_[expert_id]->d + cpu_offset_scale, data_per_gpu_tp_scale);
+              fast_scale_to_bf16(w13_scale_dst, gate_bb_[expert_id]->d + cpu_offset_scale, data_per_gpu_tp_scale);
             } else {
-              fast_fp32_to_bf16(w13_scale_dst + gpu_tp_scale_elem_count, up_bb_[expert_id]->d + cpu_offset_scale,
-                                data_per_gpu_tp_scale);
+              fast_scale_to_bf16(w13_scale_dst + gpu_tp_scale_elem_count, up_bb_[expert_id]->d + cpu_offset_scale,
+                                 data_per_gpu_tp_scale);
             }
           },
           nullptr);
@@ -505,6 +655,7 @@ class TP_MOE<AVX2_MXFP4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP4_M
   using Base::Base;
 
   void load_weights() override {
+    using scale_t = typename K::source_scale_t;
     auto& config = this->config;
     auto& tps = this->tps;
     auto& tp_count = this->tp_count;
@@ -540,9 +691,9 @@ class TP_MOE<AVX2_MXFP4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP4_M
       tpc.gate_proj = new uint8_t[(tpc.expert_num * tp_weight_elems) / 2];
       tpc.up_proj = new uint8_t[(tpc.expert_num * tp_weight_elems) / 2];
       tpc.down_proj = new uint8_t[(tpc.expert_num * tp_weight_elems) / 2];
-      tpc.gate_scale = new ggml_bf16_t[tpc.expert_num * tp_scale_elems];
-      tpc.up_scale = new ggml_bf16_t[tpc.expert_num * tp_scale_elems];
-      tpc.down_scale = new ggml_bf16_t[tpc.expert_num * tp_scale_elems];
+      tpc.gate_scale = new scale_t[tpc.expert_num * tp_scale_elems];
+      tpc.up_scale = new scale_t[tpc.expert_num * tp_scale_elems];
+      tpc.down_scale = new scale_t[tpc.expert_num * tp_scale_elems];
 
       const size_t gate_up_weight_src_offset = ((size_t)i * tp_weight_elems) / 2;
       const size_t gate_up_scale_src_offset = (size_t)i * tp_scale_elems;
@@ -556,41 +707,40 @@ class TP_MOE<AVX2_MXFP4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP4_M
             uint8_t* gate_dst = (uint8_t*)tpc.gate_proj + (expert_id * tp_weight_elems) / 2;
             uint8_t* up_dst = (uint8_t*)tpc.up_proj + (expert_id * tp_weight_elems) / 2;
             uint8_t* down_dst = (uint8_t*)tpc.down_proj + (expert_id * tp_weight_elems) / 2;
-            ggml_bf16_t* gate_scale_dst = (ggml_bf16_t*)tpc.gate_scale + expert_id * tp_scale_elems;
-            ggml_bf16_t* up_scale_dst = (ggml_bf16_t*)tpc.up_scale + expert_id * tp_scale_elems;
-            ggml_bf16_t* down_scale_dst = (ggml_bf16_t*)tpc.down_scale + expert_id * tp_scale_elems;
+            scale_t* gate_scale_dst = (scale_t*)tpc.gate_scale + expert_id * tp_scale_elems;
+            scale_t* up_scale_dst = (scale_t*)tpc.up_scale + expert_id * tp_scale_elems;
+            scale_t* down_scale_dst = (scale_t*)tpc.down_scale + expert_id * tp_scale_elems;
 
             const uint8_t* gate_src;
             const uint8_t* up_src;
             const uint8_t* down_src;
-            const ggml_bf16_t* gate_scale_src;
-            const ggml_bf16_t* up_scale_src;
-            const ggml_bf16_t* down_scale_src;
+            const scale_t* gate_scale_src;
+            const scale_t* up_scale_src;
+            const scale_t* down_scale_src;
 
             if (use_per_expert_ptrs) {
               gate_src = (const uint8_t*)config.gate_projs[0][expert_id] + gate_up_weight_src_offset;
               up_src = (const uint8_t*)config.up_projs[0][expert_id] + gate_up_weight_src_offset;
               down_src = (const uint8_t*)config.down_projs[0][expert_id];
-              gate_scale_src = (const ggml_bf16_t*)config.gate_scales[0][expert_id] + gate_up_scale_src_offset;
-              up_scale_src = (const ggml_bf16_t*)config.up_scales[0][expert_id] + gate_up_scale_src_offset;
-              down_scale_src = (const ggml_bf16_t*)config.down_scales[0][expert_id];
+              gate_scale_src = (const scale_t*)config.gate_scales[0][expert_id] + gate_up_scale_src_offset;
+              up_scale_src = (const scale_t*)config.up_scales[0][expert_id] + gate_up_scale_src_offset;
+              down_scale_src = (const scale_t*)config.down_scales[0][expert_id];
             } else {
               gate_src = (const uint8_t*)config.gate_proj + (expert_id * full_weight_elems) / 2 +
                          gate_up_weight_src_offset;
               up_src = (const uint8_t*)config.up_proj + (expert_id * full_weight_elems) / 2 +
                        gate_up_weight_src_offset;
               down_src = (const uint8_t*)config.down_proj + (expert_id * full_weight_elems) / 2;
-              gate_scale_src = (const ggml_bf16_t*)config.gate_scale + expert_id * full_scale_elems +
+              gate_scale_src = (const scale_t*)config.gate_scale + expert_id * full_scale_elems +
                                gate_up_scale_src_offset;
-              up_scale_src = (const ggml_bf16_t*)config.up_scale + expert_id * full_scale_elems +
-                             gate_up_scale_src_offset;
-              down_scale_src = (const ggml_bf16_t*)config.down_scale + expert_id * full_scale_elems;
+              up_scale_src = (const scale_t*)config.up_scale + expert_id * full_scale_elems + gate_up_scale_src_offset;
+              down_scale_src = (const scale_t*)config.down_scale + expert_id * full_scale_elems;
             }
 
             std::memcpy(gate_dst, gate_src, tp_weight_elems / 2);
             std::memcpy(up_dst, up_src, tp_weight_elems / 2);
-            std::memcpy(gate_scale_dst, gate_scale_src, sizeof(ggml_bf16_t) * tp_scale_elems);
-            std::memcpy(up_scale_dst, up_scale_src, sizeof(ggml_bf16_t) * tp_scale_elems);
+            std::memcpy(gate_scale_dst, gate_scale_src, sizeof(scale_t) * tp_scale_elems);
+            std::memcpy(up_scale_dst, up_scale_src, sizeof(scale_t) * tp_scale_elems);
 
             const size_t full_down_row_bytes = (size_t)config.intermediate_size / 2;
             const size_t tp_down_row_bytes = (size_t)tpc.intermediate_size / 2;
@@ -602,7 +752,7 @@ class TP_MOE<AVX2_MXFP4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP4_M
                           tp_down_row_bytes);
               std::memcpy(down_scale_dst + (size_t)row * tp_down_scale_row,
                           down_scale_src + (size_t)row * full_down_scale_row + down_scale_src_block_k_offset,
-                          sizeof(ggml_bf16_t) * tp_down_scale_row);
+                          sizeof(scale_t) * tp_down_scale_row);
             }
           },
           nullptr);
@@ -615,9 +765,9 @@ class TP_MOE<AVX2_MXFP4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP4_M
       delete[] (uint8_t*)tpc.gate_proj;
       delete[] (uint8_t*)tpc.up_proj;
       delete[] (uint8_t*)tpc.down_proj;
-      delete[] (ggml_bf16_t*)tpc.gate_scale;
-      delete[] (ggml_bf16_t*)tpc.up_scale;
-      delete[] (ggml_bf16_t*)tpc.down_scale;
+      delete[] (scale_t*)tpc.gate_scale;
+      delete[] (scale_t*)tpc.up_scale;
+      delete[] (scale_t*)tpc.down_scale;
     });
 
     this->weights_loaded = true;

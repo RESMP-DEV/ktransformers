@@ -667,6 +667,7 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
   py::class_<QuantConfig>(m, "QuantConfig")
       .def(py::init<>())
       .def_readwrite("quant_method", &QuantConfig::quant_method)
+      .def_readwrite("scale_format", &QuantConfig::scale_format)
       .def_readwrite("bits", &QuantConfig::bits)
       .def_readwrite("group_size", &QuantConfig::group_size)
       .def_readwrite("zero_point", &QuantConfig::zero_point)
@@ -814,6 +815,7 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
   bind_moe_module<AVX2_FP8_MOE_TP<avx2::GemmKernelAVX2FP8>>(moe_module, "AVX2FP8_MOE");
   bind_moe_module<AVX2_GPTQ_INT4_MOE_TP<avx2::GemmKernelAVX2GPTQInt4>>(moe_module, "AVX2GPTQInt4_MOE");
   bind_moe_module<AVX2_MXFP4_MOE_TP<avx2::GemmKernelAVX2MXFP4>>(moe_module, "AVX2MXFP4_MOE");
+  bind_moe_module<AVX2_MXFP4_MOE_TP<avx2::GemmKernelAVX2MXFP4DQ>>(moe_module, "AVX2MXFP4_DQ_MOE");
   bind_moe_module<AVXVNNI256_GPTQ_INT4_MOE_TP<avxvnni::GemmKernelAVXVNNI256GPTQInt4>>(moe_module,
                                                                                       "AVXVNNI256GPTQInt4_MOE");
 #endif

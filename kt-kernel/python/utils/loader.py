@@ -519,6 +519,12 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
     EXPERTS_PATH_TPL = "{base}.ffn.experts"
     PROJ_NAMES = ("w1", "w3", "w2")
 
+    def __init__(self, file_path: str, scale_format: str = "bf16"):
+        super().__init__(file_path)
+        if scale_format not in ("bf16", "ue8m0"):
+            raise ValueError(f"Unsupported MXFP4 scale_format: {scale_format}")
+        self.scale_format = scale_format
+
     def _experts_prefix_candidates(self, base_key: str) -> list[str]:
         candidates = [self.EXPERTS_PATH_TPL.format(base=base_key)]
         if base_key.startswith("model."):
@@ -563,7 +569,12 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
 
             for proj_name, dst in (("w1", gate_scales), ("w3", up_scales), ("w2", down_scales)):
                 s = self.load_tensor(f"{experts_prefix}.{exp_id}.{proj_name}.scale", device)
-                dst[exp_id] = self._ue8m0_to_bf16(s)
+                if self.scale_format == "ue8m0":
+                    if s.dtype != torch.uint8:
+                        s = s.view(torch.uint8)
+                    dst[exp_id] = s.contiguous()
+                else:
+                    dst[exp_id] = self._ue8m0_to_bf16(s)
 
         return {
             "gate": gate_weights,
