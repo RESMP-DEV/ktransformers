@@ -20,6 +20,7 @@
 #include <immintrin.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -221,14 +222,25 @@ static inline float mxfp4_dot_scaled(const ggml_bf16_t* a_row, const uint8_t* b_
   return hsum_avx2(acc);
 }
 
+inline const std::array<uint32_t, 256> UE8M0_F32_BITS = [] {
+  std::array<uint32_t, 256> table{};
+  for (int i = 1; i < 255; ++i) table[(size_t)i] = (uint32_t)i << 23;
+  return table;
+}();
+
+inline const std::array<uint16_t, 256> UE8M0_BF16_BITS = [] {
+  std::array<uint16_t, 256> table{};
+  for (int i = 1; i < 255; ++i) table[(size_t)i] = (uint16_t)i << 7;
+  return table;
+}();
+
 static inline __m256 ue8m0_scale_to_m256(uint8_t raw) {
-  const uint32_t bits = (raw == 0 || raw == 255) ? 0 : ((uint32_t)raw << 23);
-  return _mm256_castsi256_ps(_mm256_set1_epi32((int)bits));
+  return _mm256_castsi256_ps(_mm256_set1_epi32((int)UE8M0_F32_BITS[(size_t)raw]));
 }
 
 static inline ggml_bf16_t ue8m0_scale_to_bf16(uint8_t raw) {
   ggml_bf16_t out;
-  out.bits = (raw == 0 || raw == 255) ? 0 : (uint16_t)raw << 7;
+  out.bits = UE8M0_BF16_BITS[(size_t)raw];
   return out;
 }
 

@@ -19,6 +19,8 @@ and this project adheres to semantic versioning principles.
 
 ### Changed
 - `cuda/binding.cpp`: Added MXFP4 module include and binding
+- AVX2 MXFP4 DQ scale conversion now uses small UE8M0 lookup tables for FP32
+  and BF16 bit patterns instead of recomputing the bit shifts at each use.
 
 ### Build Configuration
 - Default CUDA architectures include SM_86: `80;86;89;90` (CMakeLists.txt)
