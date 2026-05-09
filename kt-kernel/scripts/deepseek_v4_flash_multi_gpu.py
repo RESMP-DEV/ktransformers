@@ -10,7 +10,10 @@ experts to CPU instead of trying to fill every visible GPU.
 from __future__ import annotations
 
 import argparse
+import importlib.machinery
+import json
 import math
+import os
 import sys
 import time
 import types
@@ -45,6 +48,24 @@ FP4_TABLE = torch.tensor(
     dtype=torch.float32,
 )
 
+PLACEMENT_PROFILES: dict[str, dict[str, float | str]] = {
+    "conservative": {
+        "gpu_memory_fraction": 0.58,
+        "gpu_headroom_gb": 10.0,
+        "expert_placement_strategy": "front-loading",
+    },
+    "throughput": {
+        "gpu_memory_fraction": 0.62,
+        "gpu_headroom_gb": 7.0,
+        "expert_placement_strategy": "front-loading",
+    },
+    "high-residency": {
+        "gpu_memory_fraction": 0.84,
+        "gpu_headroom_gb": 3.5,
+        "expert_placement_strategy": "front-loading",
+    },
+}
+
 
 def _install_hadamard_fallback() -> None:
     if "fast_hadamard_transform" in sys.modules:
@@ -56,6 +77,7 @@ def _install_hadamard_fallback() -> None:
         pass
 
     module = types.ModuleType("fast_hadamard_transform")
+    module.__spec__ = importlib.machinery.ModuleSpec("fast_hadamard_transform", loader=None)
 
     def hadamard_transform(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
         n = x.size(-1)
@@ -120,6 +142,63 @@ def _resolve_auto_mode(value: str, enabled_when_auto: bool) -> bool:
     if value == "auto":
         return enabled_when_auto
     return value == "on"
+
+
+def _resolve_placement_policy(args: argparse.Namespace) -> tuple[float, float, str]:
+    profile_name = "conservative" if args.placement_profile == "custom" else args.placement_profile
+    profile = PLACEMENT_PROFILES[profile_name]
+    gpu_memory_fraction = (
+        float(args.gpu_memory_fraction)
+        if args.gpu_memory_fraction is not None
+        else float(profile["gpu_memory_fraction"])
+    )
+    gpu_headroom_gb = (
+        float(args.gpu_headroom_gb)
+        if args.gpu_headroom_gb is not None
+        else float(profile["gpu_headroom_gb"])
+    )
+    expert_placement_strategy = (
+        args.expert_placement_strategy
+        if args.expert_placement_strategy is not None
+        else str(profile["expert_placement_strategy"])
+    )
+    return gpu_memory_fraction, gpu_headroom_gb, expert_placement_strategy
+
+
+def _parse_int_csv(value: str | None) -> list[int] | None:
+    if value is None:
+        return None
+    parsed = [int(part.strip()) for part in value.split(",") if part.strip()]
+    return parsed or None
+
+
+def _physical_core_count() -> int:
+    cpuinfo = Path("/proc/cpuinfo")
+    if cpuinfo.exists():
+        pairs: set[tuple[str, str]] = set()
+        physical_id: str | None = None
+        core_id: str | None = None
+        for raw_line in cpuinfo.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = raw_line.strip()
+            if not line:
+                if physical_id is not None and core_id is not None:
+                    pairs.add((physical_id, core_id))
+                physical_id = None
+                core_id = None
+                continue
+            if line.startswith("physical id"):
+                physical_id = line.split(":", 1)[1].strip()
+            elif line.startswith("core id"):
+                core_id = line.split(":", 1)[1].strip()
+        if physical_id is not None and core_id is not None:
+            pairs.add((physical_id, core_id))
+        if pairs:
+            return len(pairs)
+    return max(1, (os.cpu_count() or 1) // 2)
+
+
+def _resolve_cpuinfer_threads(requested_threads: int) -> int:
+    return _physical_core_count() if requested_threads <= 0 else requested_threads
 
 
 def _is_quantized_or_scale_dtype(dtype: torch.dtype) -> bool:
@@ -289,6 +368,25 @@ def _patch_torch_attention_fallback(model_module: Any) -> None:
         kernel_module = None
     if kernel_module is not None:
         kernel_module.sparse_attn = _torch_sparse_attn_fallback
+
+
+def _active_expert_indices(
+    counts: list[int],
+    experts_start_idx: int,
+    experts_end_idx: int,
+) -> list[int]:
+    return [
+        expert_idx
+        for expert_idx in range(experts_start_idx, experts_end_idx)
+        if counts[expert_idx] > 0
+    ]
+
+
+def _has_active_cpu_expert(counts: list[int], gpu_mask: torch.Tensor) -> bool:
+    for expert_idx, count in enumerate(counts):
+        if count > 0 and not bool(gpu_mask[expert_idx]):
+            return True
+    return False
 
 
 def _expert_budget(
@@ -469,19 +567,24 @@ def patched_moe_forward(self_moe: Any, x: torch.Tensor, input_ids: torch.Tensor)
     weights, indices = self_moe.gate(x, input_ids.flatten())
     y = torch.zeros_like(x, dtype=torch.float32)
     counts = torch.bincount(indices.flatten(), minlength=self_moe.n_routed_experts).tolist()
+    active_experts = _active_expert_indices(
+        counts,
+        self_moe.experts_start_idx,
+        self_moe.experts_end_idx,
+    )
     kt_cpu_moe = getattr(self_moe, "_kt_cpu_moe", None)
 
     if kt_cpu_moe is not None:
-        if dense_device.type == "cuda":
-            cuda_stream = torch.cuda.current_stream(dense_device).cuda_stream
-        else:
-            cuda_stream = 0
-        cpu_out = kt_cpu_moe.forward(x, indices, weights, cuda_stream)
-        y += cpu_out.to(device=dense_device, dtype=y.dtype)
+        gpu_mask = getattr(self_moe, "_kt_gpu_experts_mask", None)
+        if gpu_mask is None or _has_active_cpu_expert(counts, gpu_mask):
+            if dense_device.type == "cuda":
+                cuda_stream = torch.cuda.current_stream(dense_device).cuda_stream
+            else:
+                cuda_stream = 0
+            cpu_out = kt_cpu_moe.forward(x, indices, weights, cuda_stream)
+            y += cpu_out.to(device=dense_device, dtype=y.dtype)
 
-    for expert_idx in range(self_moe.experts_start_idx, self_moe.experts_end_idx):
-        if counts[expert_idx] == 0:
-            continue
+    for expert_idx in active_experts:
         expert = self_moe.experts[expert_idx]
         if expert is None:
             continue
@@ -520,6 +623,110 @@ def patched_moe_forward(self_moe: Any, x: torch.Tensor, input_ids: torch.Tensor)
     return y.type_as(x).view(shape)
 
 
+def _patch_kt_cpuinfer_stream_api() -> None:
+    """Adapt newer Python wrappers to CPUInfer builds without stream methods."""
+    from kt_kernel import _kt_kernel_ext, experts_base
+
+    if hasattr(_kt_kernel_ext.CPUInfer, "submit_with_cuda_stream"):
+        return
+
+    base_cls = experts_base.BaseMoEWrapper
+    if getattr(base_cls, "_eva_cpuinfer_no_stream_patch", False):
+        return
+
+    def submit_forward(
+        self: Any,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        cuda_stream: Any,
+    ) -> None:
+        del cuda_stream
+        flat_hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+        (
+            input_tensor_cpu,
+            immediate_experts_ids_cpu,
+            deferred_experts_ids_cpu,
+            weights_cpu,
+            output_cpu,
+            bsz_tensor_cpu,
+            _output_gpu,
+        ) = experts_base.KExpertsCPUBuffer.get_buffer(flat_hidden_states, self.num_experts_per_tok)
+
+        current_slot = self.layer_idx % experts_base.KExpertsCPUBuffer.buffer_depth
+        next_slot = (current_slot + 1) % experts_base.KExpertsCPUBuffer.buffer_depth
+        bsz_slot_tensor = bsz_tensor_cpu[current_slot]
+
+        topk_ids_long = topk_ids.to(torch.long)
+        if self.max_deferred_experts_per_token > 0:
+            protected_k = self.num_experts_per_tok - self.max_deferred_experts_per_token
+            immediate_ids, deferred_ids = self.select_deferred_experts(topk_ids_long, topk_weights, protected_k)
+        else:
+            immediate_ids = topk_ids_long
+            deferred_ids = None
+
+        input_tensor_cpu[current_slot].copy_(flat_hidden_states, non_blocking=True)
+        weights_cpu[current_slot].copy_(topk_weights, non_blocking=True)
+        immediate_experts_ids_cpu[current_slot].copy_(immediate_ids, non_blocking=True)
+        if hidden_states.device.type == "cuda":
+            torch.cuda.current_stream(hidden_states.device).synchronize()
+
+        incremental = base_cls._layer_has_pending_deferred.get(self.layer_idx - 1, False)
+        self.cpu_infer.submit(
+            self.moe.forward_task(
+                bsz_slot_tensor.data_ptr(),
+                immediate_experts_ids_cpu[current_slot].size(-1),
+                immediate_experts_ids_cpu[current_slot].data_ptr(),
+                weights_cpu[current_slot].data_ptr(),
+                input_tensor_cpu[current_slot].data_ptr(),
+                output_cpu[current_slot].data_ptr(),
+                incremental,
+            )
+        )
+
+        base_cls._layer_has_pending_deferred[self.layer_idx] = False
+        if deferred_ids is not None:
+            deferred_experts_ids_cpu[current_slot].copy_(deferred_ids, non_blocking=True)
+            if hidden_states.device.type == "cuda":
+                torch.cuda.current_stream(hidden_states.device).synchronize()
+            self.cpu_infer.submit(
+                self.moe.forward_task(
+                    bsz_slot_tensor.data_ptr(),
+                    deferred_experts_ids_cpu[current_slot].size(-1),
+                    deferred_experts_ids_cpu[current_slot].data_ptr(),
+                    weights_cpu[current_slot].data_ptr(),
+                    input_tensor_cpu[current_slot].data_ptr(),
+                    output_cpu[next_slot].data_ptr(),
+                    False,
+                )
+            )
+            base_cls._layer_has_pending_deferred[self.layer_idx] = True
+
+    def sync_forward(self: Any, hidden_states: torch.Tensor, cuda_stream: Any) -> torch.Tensor:
+        del cuda_stream
+        flat_hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+        (
+            _input_tensor_cpu,
+            _immediate_experts_ids_cpu,
+            _deferred_experts_ids_cpu,
+            _weights_cpu,
+            output_cpu,
+            _bsz_tensor_cpu,
+            output_gpu,
+        ) = experts_base.KExpertsCPUBuffer.get_buffer(flat_hidden_states, self.num_experts_per_tok)
+
+        current_slot = self.layer_idx % experts_base.KExpertsCPUBuffer.buffer_depth
+        allow_pending = 1 if base_cls._layer_has_pending_deferred.get(self.layer_idx, False) else 0
+        self.cpu_infer.sync(allow_pending)
+        output_gpu[current_slot].copy_(output_cpu[current_slot], non_blocking=True)
+        return output_gpu[current_slot]
+
+    base_cls.submit_forward = submit_forward
+    base_cls.sync_forward = sync_forward
+    base_cls._eva_cpuinfer_no_stream_patch = True
+    print("[kt-mxfp4] patched CPUInfer submit/sync stream compatibility", flush=True)
+
+
 def _attach_kt_mxfp4_cpu_moe(
     model: Any,
     ckpt_file: Path,
@@ -527,8 +734,24 @@ def _attach_kt_mxfp4_cpu_moe(
     cpuinfer_threads: int,
     threadpool_count: int,
     chunked_prefill_size: int,
+    max_deferred_experts_per_token: int,
+    cpu_moe_method: str,
+    kt_capture_batch_sizes: list[int] | None,
+    numa_nodes: list[int] | None,
 ) -> int:
     from kt_kernel import KTMoEWrapper
+
+    _patch_kt_cpuinfer_stream_api()
+    if kt_capture_batch_sizes:
+        KTMoEWrapper.set_capture_batch_sizes(kt_capture_batch_sizes)
+        print(f"  [kt-mxfp4] capture_batch_sizes={kt_capture_batch_sizes}", flush=True)
+    print(
+        "  [kt-mxfp4] "
+        f"method={cpu_moe_method}, cpuinfer_threads={cpuinfer_threads}, "
+        f"threadpool_count={threadpool_count}, numa_nodes={numa_nodes or 'default'}, "
+        f"max_deferred_experts_per_token={max_deferred_experts_per_token}",
+        flush=True,
+    )
 
     attached = 0
     for layer_idx, layer in enumerate(model.layers):
@@ -556,7 +779,9 @@ def _attach_kt_mxfp4_cpu_moe(
             threadpool_count=threadpool_count,
             weight_path=str(ckpt_file),
             chunked_prefill_size=chunked_prefill_size,
-            method="MXFP4",
+            max_deferred_experts_per_token=max_deferred_experts_per_token,
+            method=cpu_moe_method,
+            numa_nodes=numa_nodes,
         )
         physical_to_logical = torch.arange(moe.n_routed_experts, dtype=torch.int64, device="cpu").contiguous()
         wrapper.load_weights(physical_to_logical)
@@ -579,6 +804,49 @@ def sample(logits: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
     logits = logits / max(temperature, 1e-5)
     probs = torch.softmax(logits, dim=-1, dtype=torch.float32)
     return probs.div_(torch.empty_like(probs).exponential_()).argmax(dim=-1)
+
+
+def _special_token_content(value: Any) -> str | None:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        content = value.get("content")
+        if isinstance(content, str):
+            return content
+    return None
+
+
+def _load_tokenizer(tokenizer_path: Path) -> Any:
+    try:
+        from transformers import AutoTokenizer
+
+        return AutoTokenizer.from_pretrained(tokenizer_path)
+    except Exception as exc:
+        print(f"[tokenizer] AutoTokenizer unavailable ({exc}); using tokenizers fallback", flush=True)
+
+    from tokenizers import Tokenizer
+
+    tokenizer_file = tokenizer_path / "tokenizer.json"
+    config_file = tokenizer_path / "tokenizer_config.json"
+    raw_tokenizer = Tokenizer.from_file(str(tokenizer_file))
+    config = json.loads(config_file.read_text(encoding="utf-8")) if config_file.exists() else {}
+    eos_token = _special_token_content(config.get("eos_token")) or "<｜end▁of▁sentence｜>"
+    eos_token_id = raw_tokenizer.token_to_id(eos_token)
+    if eos_token_id is None:
+        raise RuntimeError(f"Could not resolve EOS token id for {eos_token!r}")
+
+    class TokenizersCompat:
+        def __init__(self, tokenizer: Tokenizer, eos_id: int) -> None:
+            self._tokenizer = tokenizer
+            self.eos_token_id = eos_id
+
+        def encode(self, text: str) -> list[int]:
+            return self._tokenizer.encode(text).ids
+
+        def decode(self, token_ids: list[int]) -> str:
+            return self._tokenizer.decode(list(token_ids), skip_special_tokens=False)
+
+    return TokenizersCompat(raw_tokenizer, eos_token_id)
 
 
 @torch.inference_mode()
@@ -674,8 +942,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--dense-gpu", default="auto", help="'auto' or a physical CUDA device id")
     parser.add_argument("--gpu-ids", default="auto", help="'auto' or comma-separated physical CUDA device ids")
-    parser.add_argument("--gpu-memory-fraction", type=float, default=0.58)
-    parser.add_argument("--gpu-headroom-gb", type=float, default=10.0)
+    parser.add_argument(
+        "--placement-profile",
+        choices=("conservative", "throughput", "high-residency", "custom"),
+        default="conservative",
+        help="Preset expert placement policy. high-residency fills more whole layers on GPU.",
+    )
+    parser.add_argument("--gpu-memory-fraction", type=float)
+    parser.add_argument("--gpu-headroom-gb", type=float)
     parser.add_argument(
         "--torch-quant-fallback",
         choices=("auto", "on", "off"),
@@ -697,7 +971,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--expert-placement-strategy",
         choices=("balanced", "front-loading"),
-        default="front-loading",
+        default=None,
         help="Choose which routed experts are moved to GPU. 'balanced' spreads capacity across layers; "
         "'front-loading' preserves the previous largest-first early-layer policy.",
     )
@@ -718,9 +992,35 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Directory containing smoothquant-int8-manifest.json and W8A8 safetensors artifacts.",
     )
-    parser.add_argument("--cpuinfer-threads", type=int, default=32)
+    parser.add_argument(
+        "--cpuinfer-threads",
+        type=int,
+        default=0,
+        help="KT CPUInfer worker threads. 0 selects physical cores, which is usually best for AVX2.",
+    )
     parser.add_argument("--threadpool-count", type=int, default=1)
+    parser.add_argument(
+        "--cpuinfer-numa-nodes",
+        help="Comma-separated NUMA ids for KT subpools. Omit for KT defaults.",
+    )
     parser.add_argument("--chunked-prefill-size", type=int, default=512)
+    parser.add_argument(
+        "--max-deferred-experts-per-token",
+        type=int,
+        default=0,
+        help="Let KT defer this many low-weight CPU experts per token for cross-layer CPU overlap.",
+    )
+    parser.add_argument(
+        "--cpu-moe-method",
+        choices=("MXFP4", "MXFP4_DQ"),
+        default="MXFP4",
+        help="KT native CPU expert method to use when --cpu-moe-backend=kt-mxfp4.",
+    )
+    parser.add_argument(
+        "--kt-capture-batch-sizes",
+        help="Comma-separated KT CPU buffer batch sizes to pre-cache, e.g. 1,16.",
+    )
+    parser.add_argument("--torch-threads", type=int, default=16)
     return parser.parse_args()
 
 
@@ -740,12 +1040,15 @@ def main() -> None:
     model_module.rank = 0
     from encoding_dsv4 import encode_messages, parse_message_from_completion_text
     from model import ModelArgs, MoE, Transformer
-    from transformers import AutoTokenizer
 
     gpu_ids = _parse_gpu_ids(args.gpu_ids)
     dense_gpu = _auto_dense_gpu(gpu_ids) if args.dense_gpu == "auto" else int(args.dense_gpu)
     if dense_gpu not in gpu_ids:
         gpu_ids.append(dense_gpu)
+    gpu_memory_fraction, gpu_headroom_gb, expert_placement_strategy = _resolve_placement_policy(args)
+    cpuinfer_numa_nodes = _parse_int_csv(args.cpuinfer_numa_nodes)
+    kt_capture_batch_sizes = _parse_int_csv(args.kt_capture_batch_sizes)
+    cpuinfer_threads = _resolve_cpuinfer_threads(args.cpuinfer_threads)
     selected_pre_hopper = _pre_hopper_selected(gpu_ids)
     torch_quant_fallback = _resolve_auto_mode(args.torch_quant_fallback, selected_pre_hopper)
     torch_attn_fallback = _resolve_auto_mode(args.torch_attn_fallback, selected_pre_hopper)
@@ -801,16 +1104,29 @@ def main() -> None:
         f"torch_attn_fallback={torch_attn_fallback}, "
         f"dense_cpu_offload={dense_cpu_offload}"
     )
+    print(
+        "Placement profile: "
+        f"profile={args.placement_profile}, "
+        f"gpu_memory_fraction={gpu_memory_fraction:.2f}, "
+        f"gpu_headroom_gb={gpu_headroom_gb:.1f}, "
+        f"strategy={expert_placement_strategy}"
+    )
+    print(
+        "CPU policy: "
+        f"torch_threads={args.torch_threads}, "
+        f"cpuinfer_threads={cpuinfer_threads}, "
+        f"threadpool_count={args.threadpool_count}, "
+        f"cpuinfer_numa_nodes={cpuinfer_numa_nodes or 'default'}, "
+        f"kt_capture_batch_sizes={kt_capture_batch_sizes or 'none'}"
+    )
 
     dense_device = torch.device(f"cuda:{dense_gpu}")
     torch.cuda.set_device(dense_gpu)
     torch.set_default_dtype(torch.bfloat16)
-    torch.set_num_threads(16)
+    torch.set_num_threads(args.torch_threads)
     torch.manual_seed(33377335)
 
     with args.config.open("r", encoding="utf-8") as f:
-        import json
-
         model_args = ModelArgs(**json.load(f))
     model_args.max_batch_size = 1
     print(
@@ -850,9 +1166,9 @@ def main() -> None:
         model,
         gpu_ids=gpu_ids,
         dense_gpu=dense_gpu,
-        gpu_memory_fraction=args.gpu_memory_fraction,
-        gpu_headroom_gb=args.gpu_headroom_gb,
-        expert_placement_strategy=args.expert_placement_strategy,
+        gpu_memory_fraction=gpu_memory_fraction,
+        gpu_headroom_gb=gpu_headroom_gb,
+        expert_placement_strategy=expert_placement_strategy,
     )
     print(f"  Done in {time.time() - started:.1f}s")
 
@@ -863,16 +1179,20 @@ def main() -> None:
             model,
             ckpt_file=ckpt_file,
             expert_map=expert_map,
-            cpuinfer_threads=args.cpuinfer_threads,
+            cpuinfer_threads=cpuinfer_threads,
             threadpool_count=args.threadpool_count,
             chunked_prefill_size=args.chunked_prefill_size,
+            max_deferred_experts_per_token=args.max_deferred_experts_per_token,
+            cpu_moe_method=args.cpu_moe_method,
+            kt_capture_batch_sizes=kt_capture_batch_sizes,
+            numa_nodes=cpuinfer_numa_nodes,
         )
         print(f"  Attached kt-kernel MXFP4 wrappers to {attached} layers in {time.time() - started:.1f}s")
 
     MoE.forward = patched_moe_forward
     torch.set_default_device(dense_device)
 
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
+    tokenizer = _load_tokenizer(args.tokenizer_path)
     print("\nReady!")
 
     messages: list[dict[str, str]] = []
