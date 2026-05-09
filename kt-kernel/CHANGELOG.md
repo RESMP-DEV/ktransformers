@@ -16,6 +16,13 @@ and this project adheres to semantic versioning principles.
   - Added test module `test/test_mxfp4_dequant.py` with CUDA availability skip logic
   - MXFP4 format: 1 E8M0 scale byte + packed FP4 data (2 values per byte)
   - Dequantization formula: `value = fp4_decode(nibble) * scale`
+- **Conservative expert-parallel dispatch switch for SFT**: Added runtime toggle for expert-parallel dispatch path.
+  - New environment variable `KT_SFT_EXPERT_PARALLEL` (default: `0`) to explicitly enable expert-parallel dispatch
+  - Defaults to coalesced rank-0 fallback unless explicitly enabled
+  - Inspectable `_dispatch_mode` attribute on `KTMoELayerWrapper` for debugging
+  - Log line on first forward call showing active dispatch mode and capability checks
+  - Unsupported distributed backends fail closed to the fallback path
+  - Added `TestDispatchModeDefault` tests proving fallback is the default behavior
 
 ### Changed
 - `cuda/binding.cpp`: Added MXFP4 module include and binding
