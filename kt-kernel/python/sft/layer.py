@@ -27,10 +27,15 @@ from .dist_utils import (
     _dist_gather_varlen_many_to_rank0,
     _dist_scatter_varlen_from_rank0,
     _qlen_offsets,
+    _supports_expert_parallel,
+    build_expert_dispatch_plan,
+    _dist_gather_varlen_to_expert_owners,
+    _dist_scatter_varlen_from_expert_owners,
 )
 
 logger = logging.getLogger(__name__)
 _KT_SFT_DEBUG = os.environ.get("KT_SFT_DEBUG", "0") == "1"
+_KT_SFT_EXPERT_PARALLEL = os.environ.get("KT_SFT_EXPERT_PARALLEL", "0") == "1"
 
 
 class KTMoELayerWrapper(nn.Module):
@@ -83,6 +88,8 @@ class KTMoELayerWrapper(nn.Module):
         # _peft_lora_modules: {expert_idx: {proj_name: (lora_A, lora_B)}}
         self._peft_lora_modules: dict[int, dict[str, tuple[nn.Module, nn.Module]]] | None = None
         self._lora_pointers_dirty = False
+        # Track the active dispatch mode for inspection/debugging
+        self._dispatch_mode: str = "fallback"  # "fallback" or "expert_parallel"
 
     def _apply(self, fn, recurse=True):
         # Protect experts from device transfer (PEFT LoRA should stay on CPU for KT)
@@ -302,7 +309,6 @@ class KTMoELayerWrapper(nn.Module):
                 raise RuntimeError(
                     f"Rank {rank} qlen mismatch: local={qlen}, all_qlens[{rank}]={all_qlens[rank]}"
                 )
-            total_qlen = sum(all_qlens)
 
             hs_flat = hidden_states.view(qlen, self.hidden_size).contiguous()
             expert_ids = topk_ids.view(qlen, self.moe_config.num_experts_per_tok).contiguous()
@@ -312,26 +318,80 @@ class KTMoELayerWrapper(nn.Module):
             submit_ids = expert_ids.detach()
             submit_wts = weights.detach()
 
-            gathered = _dist_gather_varlen_many_to_rank0(
-                [submit_hs, submit_ids, submit_wts],
-                all_qlens=all_qlens,
-                rank=rank,
-                world_size=world_size,
+            # ---- Expert-parallel dispatch path ----
+            # Route per-token entries to their expert owners when:
+            # - The backend supports point-to-point ops (NCCL/GLOO)
+            # - We have a local wrapper to run expert forward
+            # - The user explicitly enables it via KT_SFT_EXPERT_PARALLEL=1
+            # Otherwise fall back to coalesced rank-0 gather.
+            use_expert_parallel = (
+                _KT_SFT_EXPERT_PARALLEL
+                and _supports_expert_parallel()
+                and self.wrapper is not None
             )
 
-            if rank == 0:
-                if gathered is None:
-                    raise RuntimeError("Rank0 expected gathered tensors.")
-                gathered_hs, gathered_ids, gathered_wts = gathered
-                all_hs = torch.cat(gathered_hs, dim=0)
-                all_ids = torch.cat(gathered_ids, dim=0)
-                all_wts = torch.cat(gathered_wts, dim=0)
-                self.wrapper.submit_forward(
-                    all_hs,
-                    all_ids,
-                    all_wts,
-                    save_for_backward=save_for_backward,
+            # Record and log the active dispatch mode (once per layer init is enough,
+            # but we log on first call for visibility in distributed runs)
+            if not hasattr(self, "_dispatch_mode_logged"):
+                self._dispatch_mode = "expert_parallel" if use_expert_parallel else "fallback"
+                logger.info(
+                    f"Layer {self.layer_idx}: dispatch mode = {self._dispatch_mode} "
+                    f"(KT_SFT_EXPERT_PARALLEL={_KT_SFT_EXPERT_PARALLEL}, "
+                    f"backend_ok={_supports_expert_parallel()}, wrapper_ok={self.wrapper is not None})"
                 )
+                self._dispatch_mode_logged = True
+
+            if use_expert_parallel:
+                # Build routing plan and dispatch to expert owners
+                dispatch_plan = build_expert_dispatch_plan(
+                    all_qlens=all_qlens,
+                    expert_ids=expert_ids,
+                    num_experts_per_tok=self.moe_config.num_experts_per_tok,
+                    world_size=world_size,
+                )
+
+                received_per_owner = _dist_gather_varlen_to_expert_owners(
+                    [submit_hs, submit_ids, submit_wts],
+                    dispatch_plan=dispatch_plan,
+                    rank=rank,
+                    world_size=world_size,
+                )
+
+                # Rank 0 runs the expert forward for all expert-owner chunks
+                if rank == 0:
+                    for owner_rank in range(world_size):
+                        owner_tensors = received_per_owner[owner_rank]
+                        if not owner_tensors or owner_tensors[0].shape[0] == 0:
+                            continue
+                        owner_hs, owner_ids, owner_wts = owner_tensors
+                        self.wrapper.submit_forward(
+                            owner_hs,
+                            owner_ids,
+                            owner_wts,
+                            save_for_backward=save_for_backward,
+                        )
+            else:
+                # ---- Coalesced rank-0 gather fallback ----
+                gathered = _dist_gather_varlen_many_to_rank0(
+                    [submit_hs, submit_ids, submit_wts],
+                    all_qlens=all_qlens,
+                    rank=rank,
+                    world_size=world_size,
+                )
+
+                if rank == 0:
+                    if gathered is None:
+                        raise RuntimeError("Rank0 expected gathered tensors.")
+                    gathered_hs, gathered_ids, gathered_wts = gathered
+                    all_hs = torch.cat(gathered_hs, dim=0)
+                    all_ids = torch.cat(gathered_ids, dim=0)
+                    all_wts = torch.cat(gathered_wts, dim=0)
+                    self.wrapper.submit_forward(
+                        all_hs,
+                        all_ids,
+                        all_wts,
+                        save_for_backward=save_for_backward,
+                    )
 
             # Keep shared/lora experts local to avoid qlen_max-style amplification.
             gpu_output = None
