@@ -8,6 +8,7 @@
 
 #include "custom_gguf/ops.h"
 #ifdef KTRANSFORMERS_USE_CUDA
+#include "fp8/ops.h"
 #include "gptq_marlin/ops.h"
 #include "moe/ops.h"
 #include "mxfp4/ops.h"
@@ -108,5 +109,11 @@ PYBIND11_MODULE(KTransformersOps, m) {
       },
       "Function to dequantize MXFP4 (micro-scale float4) data.", py::arg("data"), py::arg("num_bytes"),
       py::arg("blk_size"), py::arg("ele_per_blk"), py::arg("device"), py::arg("target_dtype"));
+  m.def("mxfp4_linear", &mxfp4_linear,
+        "SM86 CUDA MXFP4 linear: x[M,K] @ dequant(weight_bytes[N,K/2], scales[N,K/32]).T",
+        py::arg("x"), py::arg("weight_bytes"), py::arg("scales"));
+  m.def("fp8_linear", &fp8_linear,
+        "SM86 CUDA FP8 E4M3FN linear: x[M,K] @ dequant(weight_bytes[N,K], scales[ceil(N/128),ceil(K/128)]).T",
+        py::arg("x"), py::arg("weight_bytes"), py::arg("scales"));
 #endif
 }

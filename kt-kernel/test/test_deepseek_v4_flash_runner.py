@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 from pathlib import Path
 
+import pytest
 import torch
 
 
@@ -73,3 +75,87 @@ def test_cpuinfer_thread_auto_uses_physical_core_count(monkeypatch):
 
     assert runner._resolve_cpuinfer_threads(0) == 24
     assert runner._resolve_cpuinfer_threads(12) == 12
+
+
+def test_activation_profile_loads_runtime_routing_counts(tmp_path):
+    runner = _load_runner_module()
+    profile = tmp_path / "profile.json"
+    profile.write_text(
+        json.dumps(
+            {
+                "format": "deepseek_v4_flash_runtime_profile_v1",
+                "routing": {
+                    "layers": [
+                        {"layer": 0, "expert_counts": [0, 3, 9]},
+                        {"layer": 1, "expert_counts": [5, 0, 1]},
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert runner._load_activation_scores(profile) == {
+        (0, 0): 0.0,
+        (0, 1): 3.0,
+        (0, 2): 9.0,
+        (1, 0): 5.0,
+        (1, 1): 0.0,
+        (1, 2): 1.0,
+    }
+
+
+def test_activation_aware_placement_prefers_hot_experts():
+    runner = _load_runner_module()
+    expert_sizes = {(0, 0): 10, (0, 1): 10, (1, 0): 10}
+    scores = {(0, 0): 1.0, (0, 1): 100.0, (1, 0): 2.0}
+
+    expert_map, remaining = runner._plan_expert_placement(
+        expert_sizes,
+        {0: 10},
+        "activation-aware",
+        scores,
+    )
+
+    assert expert_map[(0, 1)] == "cuda:0"
+    assert expert_map[(0, 0)] == "cpu"
+    assert expert_map[(1, 0)] == "cpu"
+    assert remaining[0] == 0
+
+
+def test_gpu_fp4_backend_auto_prefers_sm86_extension(monkeypatch):
+    runner = _load_runner_module()
+    monkeypatch.setattr(runner, "_device_is_sm86_cuda", lambda device: True)
+    monkeypatch.setattr(runner, "_load_sm86_mxfp4_ops", lambda: object())
+
+    assert runner._select_gpu_fp4_backend("auto", torch.device("cuda:0"), torch.device("cuda:0")) == "sm86-mxfp4"
+    assert runner._select_gpu_fp4_backend("torch", torch.device("cuda:0"), torch.device("cuda:0")) == "torch"
+    assert runner._select_gpu_fp4_backend("auto", torch.device("cuda:0"), torch.device("cpu")) == "torch"
+
+
+def test_gpu_fp4_backend_forced_mode_fails_without_extension(monkeypatch):
+    runner = _load_runner_module()
+    monkeypatch.setattr(runner, "_device_is_sm86_cuda", lambda device: True)
+    monkeypatch.setattr(runner, "_load_sm86_mxfp4_ops", lambda: None)
+
+    with pytest.raises(RuntimeError, match="KTransformersOps.mxfp4_linear"):
+        runner._select_gpu_fp4_backend("sm86-mxfp4", torch.device("cuda:0"), torch.device("cuda:0"))
+
+
+def test_gpu_fp8_backend_auto_prefers_sm86_extension(monkeypatch):
+    runner = _load_runner_module()
+    monkeypatch.setattr(runner, "_device_is_sm86_cuda", lambda device: True)
+    monkeypatch.setattr(runner, "_load_sm86_fp8_ops", lambda: object())
+
+    assert runner._select_gpu_fp8_backend("auto", torch.device("cuda:0"), torch.device("cuda:0")) == "sm86-fp8"
+    assert runner._select_gpu_fp8_backend("torch", torch.device("cuda:0"), torch.device("cuda:0")) == "torch"
+    assert runner._select_gpu_fp8_backend("auto", torch.device("cuda:0"), torch.device("cpu")) == "torch"
+
+
+def test_gpu_fp8_backend_forced_mode_fails_without_extension(monkeypatch):
+    runner = _load_runner_module()
+    monkeypatch.setattr(runner, "_device_is_sm86_cuda", lambda device: True)
+    monkeypatch.setattr(runner, "_load_sm86_fp8_ops", lambda: None)
+
+    with pytest.raises(RuntimeError, match="KTransformersOps.fp8_linear"):
+        runner._select_gpu_fp8_backend("sm86-fp8", torch.device("cuda:0"), torch.device("cuda:0"))

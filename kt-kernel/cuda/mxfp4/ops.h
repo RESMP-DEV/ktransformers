@@ -27,3 +27,13 @@
 torch::Tensor dequantize_mxfp4(const int8_t* data, const int num_bytes, const int blk_size,
                                const int ele_per_blk, const torch::Device device,
                                const torch::Dtype target_dtype);
+
+/// Decode packed E2M1 FP4 weights with per-32 scale and multiply by a CUDA
+/// activation matrix.
+///
+/// x            : CUDA tensor [M, K], dtype fp32/fp16/bf16
+/// weight_bytes : CUDA uint8 tensor [N, K/2], two FP4 values per byte
+/// scales       : CUDA float32 tensor [N, K/32]
+///
+/// Returns a CUDA tensor [M, N] in x.dtype.
+torch::Tensor mxfp4_linear(torch::Tensor x, torch::Tensor weight_bytes, torch::Tensor scales);

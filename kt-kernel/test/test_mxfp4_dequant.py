@@ -4,19 +4,56 @@ This test module will skip cleanly when CUDA is unavailable.
 """
 
 import sys
-import os
+
 import pytest
 import torch
+
+FP4_E2M1_TABLE = torch.tensor(
+    [
+        0.0,
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        3.0,
+        4.0,
+        6.0,
+        0.0,
+        -0.5,
+        -1.0,
+        -1.5,
+        -2.0,
+        -3.0,
+        -4.0,
+        -6.0,
+    ],
+    dtype=torch.float32,
+)
 
 # Try to import CUDA extension; skip if not available
 try:
     # The extension is built via the kt-kernel build system
     # Attempt import from the built module location
-    import KTransformersOps as ops
+    ops = __import__("KTransformersOps")
     CUDA_AVAILABLE = torch.cuda.is_available()
 except (ImportError, ModuleNotFoundError, OSError):
     CUDA_AVAILABLE = False
     ops = None
+
+
+def _decode_mxfp4_weight_reference(weight_bytes: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    packed = weight_bytes.cpu()
+    low = packed & 0x0F
+    high = (packed >> 4) & 0x0F
+    decoded = torch.empty((packed.shape[0], packed.shape[1] * 2), dtype=torch.float32)
+    decoded[:, 0::2] = FP4_E2M1_TABLE[low.long()]
+    decoded[:, 1::2] = FP4_E2M1_TABLE[high.long()]
+    scale_f = scales.cpu().float().repeat_interleave(32, dim=1)[:, : decoded.shape[1]]
+    return decoded * scale_f
+
+
+def _byte_array(data: bytes):
+    return torch.tensor(list(data), dtype=torch.uint8).contiguous().cpu().numpy()
 
 
 def _make_mxfp4_block(scale: float, values: list) -> bytes:
@@ -72,13 +109,9 @@ class TestMXFP4Dequant:
         
         # For a proper test, we need actual MXFP4 data
         # Let's create simpler test data
-        test_data = bytes([10, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0,
-                          20, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88])
+        test_data = bytes([10] + [0x12] * 16 + [20] + [0x34] * 16)
         
-        data_array = (torch.tensor(list(test_data), dtype=torch.int8)
-                      .contiguous()
-                      .cpu()
-                      .numpy())
+        data_array = _byte_array(test_data)
         data_ptr = data_array.ctypes.data
         
         result = ops.dequantize_mxfp4(
@@ -96,8 +129,7 @@ class TestMXFP4Dequant:
         ele_per_blk = 32
         
         test_data = bytes([10] + [0x12] * 16 + [20] + [0x34] * 16)
-        data_array = (torch.tensor(list(test_data), dtype=torch.int8)
-                      .contiguous().cpu().numpy())
+        data_array = _byte_array(test_data)
         data_ptr = data_array.ctypes.data
         
         result = ops.dequantize_mxfp4(
@@ -114,8 +146,7 @@ class TestMXFP4Dequant:
         ele_per_blk = 32
         
         test_data = bytes([10] + [0x12] * 16 + [20] + [0x34] * 16)
-        data_array = (torch.tensor(list(test_data), dtype=torch.int8)
-                      .contiguous().cpu().numpy())
+        data_array = _byte_array(test_data)
         data_ptr = data_array.ctypes.data
         
         result = ops.dequantize_mxfp4(
@@ -132,8 +163,7 @@ class TestMXFP4Dequant:
         ele_per_blk = 32
         
         test_data = bytes([15] + [0x55] * 16)  # Scale=15, all data=0x55
-        data_array = (torch.tensor(list(test_data), dtype=torch.int8)
-                      .contiguous().cpu().numpy())
+        data_array = _byte_array(test_data)
         data_ptr = data_array.ctypes.data
         
         result = ops.dequantize_mxfp4(
@@ -144,6 +174,25 @@ class TestMXFP4Dequant:
         assert result.shape == (1, 32)
         # All values should be non-zero since scale=15 and data=0x55
         assert torch.any(result != 0)
+
+    def test_mxfp4_linear_matches_reference_fp32(self):
+        """Test packed FP4 linear against a direct Python decode reference."""
+        packed_row = [0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE] * 2
+        weight_bytes = torch.tensor(
+            [packed_row, list(reversed(packed_row))],
+            dtype=torch.uint8,
+            device="cuda",
+        )
+        scales = torch.tensor([[1.0], [0.5]], dtype=torch.float32, device="cuda")
+        x = torch.linspace(-1.5, 1.5, steps=64, dtype=torch.float32, device="cuda").reshape(2, 32)
+
+        result = ops.mxfp4_linear(x, weight_bytes, scales)
+        decoded_weight = _decode_mxfp4_weight_reference(weight_bytes, scales)
+        expected = x.cpu().float() @ decoded_weight.T
+
+        assert result.shape == (2, 2)
+        assert result.dtype == torch.float32
+        torch.testing.assert_close(result.cpu(), expected, rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.skipif(CUDA_AVAILABLE, reason="Test runs only when CUDA is NOT available")

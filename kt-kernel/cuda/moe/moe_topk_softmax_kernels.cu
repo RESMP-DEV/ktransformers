@@ -19,6 +19,31 @@
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
+struct FloatSumOp {
+  __device__ __forceinline__ float operator()(const float& a, const float& b) const {
+    return a + b;
+  }
+};
+
+struct FloatMaxOp {
+  __device__ __forceinline__ float operator()(const float& a, const float& b) const {
+    return a > b ? a : b;
+  }
+};
+
+template <typename Kvp>
+struct KvpArgMaxOp {
+  __device__ __forceinline__ Kvp operator()(const Kvp& a, const Kvp& b) const {
+    if (a.value > b.value) {
+      return a;
+    }
+    if (b.value > a.value) {
+      return b;
+    }
+    return a.key <= b.key ? a : b;
+  }
+};
+
 /// Aligned array type
 template <
     typename T,
@@ -44,7 +69,7 @@ __launch_bounds__(TPB) __global__
 
   const int thread_row_offset = blockIdx.x * num_cols;
 
-  cub::Sum sum;
+  FloatSumOp sum;
   float threadData(-FLT_MAX);
 
   // Don't touch finished rows.
@@ -57,7 +82,7 @@ __launch_bounds__(TPB) __global__
     threadData = max(static_cast<float>(input[idx]), threadData);
   }
 
-  const float maxElem = BlockReduce(tmpStorage).Reduce(threadData, cub::Max());
+  const float maxElem = BlockReduce(tmpStorage).Reduce(threadData, FloatMaxOp());
 
   if (threadIdx.x == 0) {
     float_max = maxElem;
@@ -101,7 +126,7 @@ __launch_bounds__(TPB) __global__ void moeTopK(
   __shared__ typename BlockReduce::TempStorage tmpStorage;
 
   cub_kvp thread_kvp;
-  cub::ArgMax arg_max;
+  KvpArgMaxOp<cub_kvp> arg_max;
 
   const int num_rows = gridDim.x;
   const int block_row = blockIdx.x;

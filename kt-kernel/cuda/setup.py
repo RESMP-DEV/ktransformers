@@ -14,10 +14,12 @@ setup(
             'KTransformersOps', [
                 'custom_gguf/dequant.cu',
                 'binding.cpp',
+                'fp8/fp8_linear.cu',
                 'gptq_marlin/gptq_marlin.cu',
                 'moe/moe_topk_softmax_kernels.cu',
                 'mxfp4/mxfp4_dequant.cu',  # MXFP4 dequantization kernel for SM_86
             ],
+            define_macros=[('KTRANSFORMERS_USE_CUDA', None)],
             extra_compile_args={
                 'cxx': ['-O3'],
                 'nvcc': [

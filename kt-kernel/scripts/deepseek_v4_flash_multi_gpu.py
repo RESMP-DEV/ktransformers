@@ -65,6 +65,46 @@ PLACEMENT_PROFILES: dict[str, dict[str, float | str]] = {
         "expert_placement_strategy": "front-loading",
     },
 }
+FALLBACK_PROFILE: dict[str, dict[str, float | int]] = {}
+CPU_MOE_PROFILE: dict[str, float | int] = {
+    "submitted_calls": 0,
+    "skipped_calls": 0,
+    "active_cpu_expert_hits": 0,
+}
+ROUTING_COUNTS: dict[int, list[int]] = {}
+SM86_MXFP4_OPS: Any | None = None
+
+
+def _profile_bucket(name: str) -> dict[str, float | int]:
+    bucket = FALLBACK_PROFILE.get(name)
+    if bucket is None:
+        bucket = {"calls": 0, "seconds": 0.0, "tokens": 0, "weight_bytes": 0}
+        FALLBACK_PROFILE[name] = bucket
+    return bucket
+
+
+def _record_fallback_profile(
+    name: str,
+    elapsed: float,
+    tokens: int,
+    weight: torch.Tensor | None = None,
+) -> None:
+    bucket = _profile_bucket(name)
+    bucket["calls"] = int(bucket["calls"]) + 1
+    bucket["seconds"] = float(bucket["seconds"]) + elapsed
+    bucket["tokens"] = int(bucket["tokens"]) + tokens
+    if weight is not None:
+        bucket["weight_bytes"] = int(bucket["weight_bytes"]) + weight.numel() * weight.element_size()
+
+
+def _record_routing_counts(layer_idx: int | None, counts: list[int]) -> None:
+    if layer_idx is None:
+        return
+    stored = ROUTING_COUNTS.setdefault(layer_idx, [0] * len(counts))
+    if len(stored) < len(counts):
+        stored.extend([0] * (len(counts) - len(stored)))
+    for expert_idx, count in enumerate(counts):
+        stored[expert_idx] += int(count)
 
 
 def _install_hadamard_fallback() -> None:
@@ -138,10 +178,166 @@ def _gpu_has_int8_tensor_cores(gid: int) -> bool:
     return _capability_has_int8_tensor_cores(torch.cuda.get_device_capability(gid))
 
 
+def _device_is_sm86_cuda(device: torch.device) -> bool:
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return False
+    device_index = device.index if device.index is not None else torch.cuda.current_device()
+    return torch.cuda.get_device_capability(device_index) == (8, 6)
+
+
 def _resolve_auto_mode(value: str, enabled_when_auto: bool) -> bool:
     if value == "auto":
         return enabled_when_auto
     return value == "on"
+
+
+def _load_sm86_mxfp4_ops() -> Any | None:
+    global SM86_MXFP4_OPS
+    if SM86_MXFP4_OPS is not None:
+        return SM86_MXFP4_OPS
+    cuda_extension_dir = Path(__file__).resolve().parents[1] / "cuda"
+    if str(cuda_extension_dir) not in sys.path:
+        sys.path.insert(0, str(cuda_extension_dir))
+    try:
+        ops = __import__("KTransformersOps")
+    except Exception:
+        return None
+    if not hasattr(ops, "mxfp4_linear"):
+        return None
+    SM86_MXFP4_OPS = ops
+    return ops
+
+
+def _load_sm86_fp8_ops() -> Any | None:
+    ops = _load_sm86_mxfp4_ops()
+    if ops is None or not hasattr(ops, "fp8_linear"):
+        return None
+    return ops
+
+
+def _sm86_mxfp4_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    if x.device.type != "cuda" or weight.device.type != "cuda":
+        raise RuntimeError("SM86 MXFP4 linear requires CUDA activations and CUDA weights")
+    if x.device != weight.device:
+        raise RuntimeError(f"SM86 MXFP4 linear requires x and weight on the same device: {x.device} != {weight.device}")
+    if not _device_is_sm86_cuda(x.device):
+        raise RuntimeError(f"SM86 MXFP4 linear requires an sm_86 CUDA device, got {x.device}")
+    ops = _load_sm86_mxfp4_ops()
+    if ops is None:
+        raise RuntimeError("KTransformersOps.mxfp4_linear is not available; build kt-kernel/cuda first")
+    weight_u8 = getattr(weight, "_eva_mxfp4_weight_u8", None)
+    if weight_u8 is None or weight_u8.device != weight.device:
+        weight_u8 = weight.view(torch.uint8)
+        weight._eva_mxfp4_weight_u8 = weight_u8
+    scale = getattr(weight, "scale", None)
+    if scale is None:
+        raise RuntimeError("FP4 weight is missing its .scale tensor")
+    scale_f32 = getattr(weight, "_eva_mxfp4_scale_f32", None)
+    if scale_f32 is None or scale_f32.device != weight.device:
+        scale_f32 = scale.to(device=weight.device, dtype=torch.float32).contiguous()
+        weight._eva_mxfp4_scale_f32 = scale_f32
+
+    original_shape = x.shape[:-1]
+    x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+    out_2d = ops.mxfp4_linear(x_2d, weight_u8, scale_f32)
+    return out_2d.reshape(*original_shape, out_2d.shape[-1]).to(dtype=output_dtype)
+
+
+def _sm86_fp8_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    if x.device.type != "cuda" or weight.device.type != "cuda":
+        raise RuntimeError("SM86 FP8 linear requires CUDA activations and CUDA weights")
+    if x.device != weight.device:
+        raise RuntimeError(f"SM86 FP8 linear requires x and weight on the same device: {x.device} != {weight.device}")
+    if not _device_is_sm86_cuda(x.device):
+        raise RuntimeError(f"SM86 FP8 linear requires an sm_86 CUDA device, got {x.device}")
+    ops = _load_sm86_fp8_ops()
+    if ops is None:
+        raise RuntimeError("KTransformersOps.fp8_linear is not available; build kt-kernel/cuda first")
+    weight_u8 = getattr(weight, "_eva_fp8_weight_u8", None)
+    if weight_u8 is None or weight_u8.device != weight.device:
+        weight_u8 = weight.view(torch.uint8)
+        weight._eva_fp8_weight_u8 = weight_u8
+    scale = getattr(weight, "scale", None)
+    if scale is None:
+        raise RuntimeError("FP8 weight is missing its .scale tensor")
+    scale_f32 = getattr(weight, "_eva_fp8_scale_f32", None)
+    if scale_f32 is None or scale_f32.device != weight.device:
+        scale_f32 = scale.to(device=weight.device, dtype=torch.float32).contiguous()
+        weight._eva_fp8_scale_f32 = scale_f32
+
+    original_shape = x.shape[:-1]
+    x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+    out_2d = ops.fp8_linear(x_2d, weight_u8, scale_f32)
+    return out_2d.reshape(*original_shape, out_2d.shape[-1]).to(dtype=output_dtype)
+
+
+def _can_use_sm86_quant(activation_device: torch.device, weight_device: torch.device) -> bool:
+    return (
+        activation_device.type == "cuda"
+        and weight_device.type == "cuda"
+        and activation_device == weight_device
+        and _device_is_sm86_cuda(activation_device)
+    )
+
+
+def _select_gpu_fp4_backend(
+    requested: str,
+    activation_device: torch.device,
+    weight_device: torch.device,
+) -> str:
+    if requested == "torch":
+        return "torch"
+    if requested == "sm86-mxfp4":
+        if not _can_use_sm86_quant(activation_device, weight_device):
+            raise RuntimeError(
+                "--gpu-fp4-backend=sm86-mxfp4 requires activations and weights on the same sm_86 CUDA device, "
+                f"got x={activation_device}, weight={weight_device}"
+            )
+        if _load_sm86_mxfp4_ops() is None:
+            raise RuntimeError(
+                "--gpu-fp4-backend=sm86-mxfp4 requires KTransformersOps.mxfp4_linear. "
+                "Build kt-kernel/cuda before running."
+            )
+        return "sm86-mxfp4"
+    if requested != "auto":
+        raise ValueError(f"unknown GPU FP4 backend: {requested}")
+    if _can_use_sm86_quant(activation_device, weight_device) and _load_sm86_mxfp4_ops() is not None:
+        return "sm86-mxfp4"
+    return "torch"
+
+
+def _select_gpu_fp8_backend(
+    requested: str,
+    activation_device: torch.device,
+    weight_device: torch.device,
+) -> str:
+    if requested == "torch":
+        return "torch"
+    if requested == "sm86-fp8":
+        if not _can_use_sm86_quant(activation_device, weight_device):
+            raise RuntimeError(
+                "--gpu-fp8-backend=sm86-fp8 requires activations and weights on the same sm_86 CUDA device, "
+                f"got x={activation_device}, weight={weight_device}"
+            )
+        if _load_sm86_fp8_ops() is None:
+            raise RuntimeError(
+                "--gpu-fp8-backend=sm86-fp8 requires KTransformersOps.fp8_linear. "
+                "Build kt-kernel/cuda before running."
+            )
+        return "sm86-fp8"
+    if requested != "auto":
+        raise ValueError(f"unknown GPU FP8 backend: {requested}")
+    if _can_use_sm86_quant(activation_device, weight_device) and _load_sm86_fp8_ops() is not None:
+        return "sm86-fp8"
+    return "torch"
 
 
 def _resolve_placement_policy(args: argparse.Namespace) -> tuple[float, float, str]:
@@ -199,6 +395,36 @@ def _physical_core_count() -> int:
 
 def _resolve_cpuinfer_threads(requested_threads: int) -> int:
     return _physical_core_count() if requested_threads <= 0 else requested_threads
+
+
+def _extract_activation_scores(payload: dict[str, Any]) -> dict[tuple[int, int], float]:
+    routing_payload = payload.get("routing", payload)
+    layers = routing_payload.get("layers")
+    if not isinstance(layers, list):
+        raise ValueError("Activation profile must contain routing.layers or layers")
+
+    scores: dict[tuple[int, int], float] = {}
+    for layer_payload in layers:
+        if not isinstance(layer_payload, dict):
+            continue
+        raw_layer_idx = layer_payload.get("layer", layer_payload.get("layer_idx"))
+        counts = layer_payload.get("expert_counts", layer_payload.get("counts"))
+        if raw_layer_idx is None or not isinstance(counts, list):
+            continue
+        layer_idx = int(raw_layer_idx)
+        for expert_idx, count in enumerate(counts):
+            scores[(layer_idx, expert_idx)] = float(count)
+    return scores
+
+
+def _load_activation_scores(path: Path | None) -> dict[tuple[int, int], float] | None:
+    if path is None:
+        return None
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    scores = _extract_activation_scores(payload)
+    if not scores:
+        raise ValueError(f"Activation profile did not contain any expert counts: {path}")
+    return scores
 
 
 def _is_quantized_or_scale_dtype(dtype: torch.dtype) -> bool:
@@ -277,7 +503,7 @@ def _torch_fp4_act_quant(
     return x.contiguous(), scale
 
 
-def _patch_torch_quant_fallback(model_module: Any) -> None:
+def _patch_torch_quant_fallback(model_module: Any, gpu_fp4_backend: str, gpu_fp8_backend: str) -> None:
     original_linear = model_module.linear
 
     def fallback_linear(
@@ -287,21 +513,47 @@ def _patch_torch_quant_fallback(model_module: Any) -> None:
     ) -> torch.Tensor:
         assert bias is None
         if weight.dtype == FP8_DTYPE:
+            started = time.perf_counter()
             output_device = x.device
             output_dtype = x.dtype
+            selected_backend = _select_gpu_fp8_backend(gpu_fp8_backend, x.device, weight.device)
+            if selected_backend == "sm86-fp8":
+                result = _sm86_fp8_linear(x, weight, output_dtype)
+                _record_fallback_profile(
+                    "linear_fp8_sm86",
+                    time.perf_counter() - started,
+                    x.numel() // x.size(-1),
+                    weight,
+                )
+                return result
             compute_device = weight.device
             weight_f = _dequant_fp8_weight(weight, compute_device)
             x_f = x.to(device=compute_device, dtype=torch.float32)
             y = functional.linear(x_f, weight_f)
-            return y.to(device=output_device, dtype=output_dtype)
+            result = y.to(device=output_device, dtype=output_dtype)
+            _record_fallback_profile("linear_fp8", time.perf_counter() - started, x.numel() // x.size(-1), weight)
+            return result
         if weight.dtype == FP4_DTYPE:
+            started = time.perf_counter()
             output_device = x.device
             output_dtype = x.dtype
+            selected_backend = _select_gpu_fp4_backend(gpu_fp4_backend, x.device, weight.device)
+            if selected_backend == "sm86-mxfp4":
+                result = _sm86_mxfp4_linear(x, weight, output_dtype)
+                _record_fallback_profile(
+                    "linear_fp4_sm86_mxfp4",
+                    time.perf_counter() - started,
+                    x.numel() // x.size(-1),
+                    weight,
+                )
+                return result
             compute_device = weight.device
             weight_f = _dequant_fp4_weight(weight, compute_device)
             x_f = x.to(device=compute_device, dtype=torch.float32)
             y = functional.linear(x_f, weight_f)
-            return y.to(device=output_device, dtype=output_dtype)
+            result = y.to(device=output_device, dtype=output_dtype)
+            _record_fallback_profile("linear_fp4", time.perf_counter() - started, x.numel() // x.size(-1), weight)
+            return result
         return original_linear(x, weight, bias)
 
     model_module.linear = fallback_linear
@@ -330,10 +582,13 @@ def _torch_sparse_attn_fallback(
     requests more than that. This fallback keeps the same sink-token denominator
     behavior and favors compatibility over speed for smoke/debug runs.
     """
+    started = time.perf_counter()
     bsz, seqlen, n_heads, _ = q.size()
     topk = topk_idxs.size(-1)
     if topk == 0:
-        return torch.zeros_like(q)
+        result = torch.zeros_like(q)
+        _record_fallback_profile("sparse_attn_torch", time.perf_counter() - started, bsz * seqlen)
+        return result
 
     if kv.device != q.device:
         kv = kv.to(q.device)
@@ -357,7 +612,9 @@ def _torch_sparse_attn_fallback(
     denom = weights.sum(dim=-1) + torch.exp(sink_scores - scores_max)
     probs = weights / denom.clamp_min(1e-20)[..., None]
     out = torch.einsum("bshk,bskd->bshd", probs, gathered.float())
-    return out.to(dtype=q.dtype)
+    result = out.to(dtype=q.dtype)
+    _record_fallback_profile("sparse_attn_torch", time.perf_counter() - started, bsz * seqlen)
+    return result
 
 
 def _patch_torch_attention_fallback(model_module: Any) -> None:
@@ -414,9 +671,18 @@ def _expert_budget(
 def _ordered_expert_keys(
     expert_sizes: dict[tuple[int, int], int],
     expert_placement_strategy: str,
+    expert_activation_scores: dict[tuple[int, int], float] | None = None,
 ) -> list[tuple[int, int]]:
     if expert_placement_strategy == "front-loading":
         return sorted(expert_sizes, key=lambda key: (-expert_sizes[key], key[0], key[1]))
+
+    if expert_placement_strategy == "activation-aware":
+        if not expert_activation_scores:
+            raise ValueError("activation-aware placement requires --expert-activation-profile")
+        return sorted(
+            expert_sizes,
+            key=lambda key: (-expert_activation_scores.get(key, 0.0), -expert_sizes[key], key[0], key[1]),
+        )
 
     if expert_placement_strategy != "balanced":
         raise ValueError(f"Unsupported expert placement strategy: {expert_placement_strategy}")
@@ -442,16 +708,17 @@ def _plan_expert_placement(
     expert_sizes: dict[tuple[int, int], int],
     gpu_budget: dict[int, int],
     expert_placement_strategy: str,
+    expert_activation_scores: dict[tuple[int, int], float] | None = None,
 ) -> tuple[dict[tuple[int, int], str], dict[int, int]]:
     placement_order = sorted(gpu_budget, key=lambda gid: gpu_budget[gid], reverse=True)
     remaining_budget = dict(gpu_budget)
     expert_map: dict[tuple[int, int], str] = {}
 
-    for key in _ordered_expert_keys(expert_sizes, expert_placement_strategy):
+    for key in _ordered_expert_keys(expert_sizes, expert_placement_strategy, expert_activation_scores):
         size = expert_sizes[key]
         candidates = [gid for gid in placement_order if remaining_budget[gid] >= size]
         if candidates:
-            if expert_placement_strategy == "balanced":
+            if expert_placement_strategy in {"balanced", "activation-aware"}:
                 gid = max(candidates, key=lambda candidate: (remaining_budget[candidate], -placement_order.index(candidate)))
             else:
                 gid = candidates[0]
@@ -470,6 +737,7 @@ def distribute_experts(
     gpu_memory_fraction: float,
     gpu_headroom_gb: float,
     expert_placement_strategy: str,
+    expert_activation_scores: dict[tuple[int, int], float] | None,
 ) -> dict[tuple[int, int], str]:
     """Distribute routed experts with a conservative GPU memory budget."""
     gpu_headroom_bytes = int(gpu_headroom_gb * 1024**3)
@@ -494,6 +762,7 @@ def distribute_experts(
         expert_sizes,
         gpu_budget,
         expert_placement_strategy,
+        expert_activation_scores,
     )
     gpu_placed = sum(1 for device in expert_map.values() if device.startswith("cuda:"))
     cpu_placed = sum(1 for device in expert_map.values() if device == "cpu")
@@ -567,6 +836,8 @@ def patched_moe_forward(self_moe: Any, x: torch.Tensor, input_ids: torch.Tensor)
     weights, indices = self_moe.gate(x, input_ids.flatten())
     y = torch.zeros_like(x, dtype=torch.float32)
     counts = torch.bincount(indices.flatten(), minlength=self_moe.n_routed_experts).tolist()
+    layer_idx = getattr(self_moe, "_eva_layer_idx", None)
+    _record_routing_counts(layer_idx, counts)
     active_experts = _active_expert_indices(
         counts,
         self_moe.experts_start_idx,
@@ -576,13 +847,22 @@ def patched_moe_forward(self_moe: Any, x: torch.Tensor, input_ids: torch.Tensor)
 
     if kt_cpu_moe is not None:
         gpu_mask = getattr(self_moe, "_kt_gpu_experts_mask", None)
-        if gpu_mask is None or _has_active_cpu_expert(counts, gpu_mask):
+        active_cpu_hits = (
+            sum(count for expert_idx, count in enumerate(counts) if count > 0 and not bool(gpu_mask[expert_idx]))
+            if gpu_mask is not None
+            else sum(counts)
+        )
+        CPU_MOE_PROFILE["active_cpu_expert_hits"] = int(CPU_MOE_PROFILE["active_cpu_expert_hits"]) + active_cpu_hits
+        if gpu_mask is None or active_cpu_hits > 0:
+            CPU_MOE_PROFILE["submitted_calls"] = int(CPU_MOE_PROFILE["submitted_calls"]) + 1
             if dense_device.type == "cuda":
                 cuda_stream = torch.cuda.current_stream(dense_device).cuda_stream
             else:
                 cuda_stream = 0
             cpu_out = kt_cpu_moe.forward(x, indices, weights, cuda_stream)
             y += cpu_out.to(device=dense_device, dtype=y.dtype)
+        else:
+            CPU_MOE_PROFILE["skipped_calls"] = int(CPU_MOE_PROFILE["skipped_calls"]) + 1
 
     for expert_idx in active_experts:
         expert = self_moe.experts[expert_idx]
@@ -800,6 +1080,99 @@ def _attach_kt_mxfp4_cpu_moe(
     return attached
 
 
+def _runtime_profile_payload(
+    args: argparse.Namespace,
+    gpu_memory_fraction: float,
+    gpu_headroom_gb: float,
+    expert_placement_strategy: str,
+    expert_map: dict[tuple[int, int], str],
+) -> dict[str, Any]:
+    routing_layers = []
+    for layer_idx in sorted(ROUTING_COUNTS):
+        counts = ROUTING_COUNTS[layer_idx]
+        top_experts = sorted(
+            ({"expert": expert_idx, "count": count} for expert_idx, count in enumerate(counts)),
+            key=lambda item: (-int(item["count"]), int(item["expert"])),
+        )[:16]
+        routing_layers.append(
+            {
+                "layer": layer_idx,
+                "expert_counts": counts,
+                "total_hits": sum(counts),
+                "top_experts": top_experts,
+            }
+        )
+
+    placement_layers: dict[int, dict[str, int]] = {}
+    for (layer_idx, _expert_idx), device in expert_map.items():
+        layer_payload = placement_layers.setdefault(layer_idx, {"gpu_experts": 0, "cpu_experts": 0})
+        if device.startswith("cuda:"):
+            layer_payload["gpu_experts"] += 1
+        else:
+            layer_payload["cpu_experts"] += 1
+
+    return {
+        "format": "deepseek_v4_flash_runtime_profile_v1",
+        "placement": {
+            "profile": args.placement_profile,
+            "gpu_memory_fraction": gpu_memory_fraction,
+            "gpu_headroom_gb": gpu_headroom_gb,
+            "strategy": expert_placement_strategy,
+            "layers": [
+                {"layer": layer_idx, **placement_layers[layer_idx]}
+                for layer_idx in sorted(placement_layers)
+            ],
+        },
+        "fallback": FALLBACK_PROFILE,
+        "cpu_moe": CPU_MOE_PROFILE,
+        "routing": {
+            "layers": routing_layers,
+        },
+    }
+
+
+def _write_runtime_profile(
+    path: Path,
+    args: argparse.Namespace,
+    gpu_memory_fraction: float,
+    gpu_headroom_gb: float,
+    expert_placement_strategy: str,
+    expert_map: dict[tuple[int, int], str],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = _runtime_profile_payload(
+        args,
+        gpu_memory_fraction,
+        gpu_headroom_gb,
+        expert_placement_strategy,
+        expert_map,
+    )
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(f"\nWrote runtime profile: {path}", flush=True)
+
+
+def _print_runtime_profile_summary() -> None:
+    if FALLBACK_PROFILE:
+        print("\nFallback profile:", flush=True)
+        for name in sorted(FALLBACK_PROFILE):
+            bucket = FALLBACK_PROFILE[name]
+            calls = int(bucket["calls"])
+            seconds = float(bucket["seconds"])
+            tokens = int(bucket["tokens"])
+            print(
+                f"  {name}: calls={calls}, seconds={seconds:.3f}, "
+                f"tokens={tokens}, ms_per_call={seconds * 1000 / max(calls, 1):.2f}",
+                flush=True,
+            )
+    print(
+        "CPU MoE profile: "
+        f"submitted_calls={CPU_MOE_PROFILE['submitted_calls']}, "
+        f"skipped_calls={CPU_MOE_PROFILE['skipped_calls']}, "
+        f"active_cpu_expert_hits={CPU_MOE_PROFILE['active_cpu_expert_hits']}",
+        flush=True,
+    )
+
+
 def sample(logits: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
     logits = logits / max(temperature, 1e-5)
     probs = torch.softmax(logits, dim=-1, dtype=torch.float32)
@@ -970,10 +1343,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--expert-placement-strategy",
-        choices=("balanced", "front-loading"),
+        choices=("activation-aware", "balanced", "front-loading"),
         default=None,
         help="Choose which routed experts are moved to GPU. 'balanced' spreads capacity across layers; "
-        "'front-loading' preserves the previous largest-first early-layer policy.",
+        "'front-loading' preserves the previous largest-first early-layer policy; "
+        "'activation-aware' uses --expert-activation-profile counts.",
+    )
+    parser.add_argument(
+        "--expert-activation-profile",
+        type=Path,
+        help="Runtime profile JSON from --profile-output; enables activation-aware expert placement.",
     )
     parser.add_argument(
         "--cpu-moe-backend",
@@ -986,6 +1365,26 @@ def parse_args() -> argparse.Namespace:
         choices=("native", "int8-smoothquant"),
         default="native",
         help="GPU resident-expert backend. int8-smoothquant requires precomputed calibrated W8A8 artifacts.",
+    )
+    parser.add_argument(
+        "--gpu-fp4-backend",
+        choices=("auto", "torch", "sm86-mxfp4"),
+        default="auto",
+        help=(
+            "FP4 linear backend for CUDA-resident weights inside the compatibility quant shim. "
+            "'auto' uses KTransformersOps.mxfp4_linear on sm_86 when built, otherwise torch; "
+            "'sm86-mxfp4' fails hard instead of falling back to torch FP4 dequant."
+        ),
+    )
+    parser.add_argument(
+        "--gpu-fp8-backend",
+        choices=("auto", "torch", "sm86-fp8"),
+        default="auto",
+        help=(
+            "FP8 linear backend for CUDA-resident weights inside the compatibility quant shim. "
+            "'auto' uses KTransformersOps.fp8_linear on sm_86 when built, otherwise torch; "
+            "'sm86-fp8' fails hard instead of falling back to torch FP8 dequant."
+        ),
     )
     parser.add_argument(
         "--gpu-smoothquant-artifacts",
@@ -1021,6 +1420,11 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated KT CPU buffer batch sizes to pre-cache, e.g. 1,16.",
     )
     parser.add_argument("--torch-threads", type=int, default=16)
+    parser.add_argument(
+        "--profile-output",
+        type=Path,
+        help="Write fallback timing, CPU MoE, placement, and routing-count profile JSON.",
+    )
     return parser.parse_args()
 
 
@@ -1049,6 +1453,7 @@ def main() -> None:
     cpuinfer_numa_nodes = _parse_int_csv(args.cpuinfer_numa_nodes)
     kt_capture_batch_sizes = _parse_int_csv(args.kt_capture_batch_sizes)
     cpuinfer_threads = _resolve_cpuinfer_threads(args.cpuinfer_threads)
+    expert_activation_scores = _load_activation_scores(args.expert_activation_profile)
     selected_pre_hopper = _pre_hopper_selected(gpu_ids)
     torch_quant_fallback = _resolve_auto_mode(args.torch_quant_fallback, selected_pre_hopper)
     torch_attn_fallback = _resolve_auto_mode(args.torch_attn_fallback, selected_pre_hopper)
@@ -1056,8 +1461,12 @@ def main() -> None:
         dense_cpu_offload = "quantized" if torch_quant_fallback else "none"
     else:
         dense_cpu_offload = args.dense_cpu_offload
+    if args.gpu_fp4_backend == "sm86-mxfp4" and not torch_quant_fallback:
+        raise RuntimeError("--gpu-fp4-backend=sm86-mxfp4 requires --torch-quant-fallback=auto or on")
+    if args.gpu_fp8_backend == "sm86-fp8" and not torch_quant_fallback:
+        raise RuntimeError("--gpu-fp8-backend=sm86-fp8 requires --torch-quant-fallback=auto or on")
     if torch_quant_fallback:
-        _patch_torch_quant_fallback(model_module)
+        _patch_torch_quant_fallback(model_module, args.gpu_fp4_backend, args.gpu_fp8_backend)
     if torch_attn_fallback:
         _patch_torch_attention_fallback(model_module)
 
@@ -1078,6 +1487,8 @@ def main() -> None:
     print(
         "GPU quant policy: "
         f"backend={args.gpu_quant_backend}, "
+        f"fp4_backend={args.gpu_fp4_backend}, "
+        f"fp8_backend={args.gpu_fp8_backend}, "
         f"smoothquant_artifacts={args.gpu_smoothquant_artifacts or 'none'}, "
         f"int8_tensor_core_gpus={int8_tc_gpus}"
     )
@@ -1109,7 +1520,8 @@ def main() -> None:
         f"profile={args.placement_profile}, "
         f"gpu_memory_fraction={gpu_memory_fraction:.2f}, "
         f"gpu_headroom_gb={gpu_headroom_gb:.1f}, "
-        f"strategy={expert_placement_strategy}"
+        f"strategy={expert_placement_strategy}, "
+        f"activation_profile={args.expert_activation_profile or 'none'}"
     )
     print(
         "CPU policy: "
@@ -1161,6 +1573,8 @@ def main() -> None:
     print(f"  Done in {time.time() - started:.1f}s")
 
     print(f"\nDistributing experts across GPUs {gpu_ids}...")
+    for layer_idx, layer in enumerate(model.layers):
+        layer.ffn._eva_layer_idx = layer_idx
     started = time.time()
     expert_map = distribute_experts(
         model,
@@ -1169,6 +1583,7 @@ def main() -> None:
         gpu_memory_fraction=gpu_memory_fraction,
         gpu_headroom_gb=gpu_headroom_gb,
         expert_placement_strategy=expert_placement_strategy,
+        expert_activation_scores=expert_activation_scores,
     )
     print(f"  Done in {time.time() - started:.1f}s")
 
@@ -1196,34 +1611,46 @@ def main() -> None:
     print("\nReady!")
 
     messages: list[dict[str, str]] = []
-    while True:
-        try:
-            prompt = input(">>> ")
-        except (EOFError, KeyboardInterrupt):
-            break
-        if prompt == "/exit":
-            break
-        if prompt == "/clear":
-            messages.clear()
-            continue
-        if not prompt.strip():
-            continue
+    try:
+        while True:
+            try:
+                prompt = input(">>> ")
+            except (EOFError, KeyboardInterrupt):
+                break
+            if prompt == "/exit":
+                break
+            if prompt == "/clear":
+                messages.clear()
+                continue
+            if not prompt.strip():
+                continue
 
-        messages.append({"role": "user", "content": prompt})
-        prompt_tokens = tokenizer.encode(encode_messages(messages, thinking_mode="chat"))
-        print(f"  ({len(prompt_tokens)} prompt tokens)")
+            messages.append({"role": "user", "content": prompt})
+            prompt_tokens = tokenizer.encode(encode_messages(messages, thinking_mode="chat"))
+            print(f"  ({len(prompt_tokens)} prompt tokens)")
 
-        completion_tokens = generate(
-            model,
-            [prompt_tokens],
-            args.max_new_tokens,
-            tokenizer.eos_token_id,
-            dense_device,
-            args.temperature,
-        )
-        completion = tokenizer.decode(completion_tokens[0])
-        print(completion)
-        messages.append(parse_message_from_completion_text(completion, thinking_mode="chat"))
+            completion_tokens = generate(
+                model,
+                [prompt_tokens],
+                args.max_new_tokens,
+                tokenizer.eos_token_id,
+                dense_device,
+                args.temperature,
+            )
+            completion = tokenizer.decode(completion_tokens[0])
+            print(completion)
+            messages.append(parse_message_from_completion_text(completion, thinking_mode="chat"))
+    finally:
+        _print_runtime_profile_summary()
+        if args.profile_output is not None:
+            _write_runtime_profile(
+                args.profile_output,
+                args,
+                gpu_memory_fraction,
+                gpu_headroom_gb,
+                expert_placement_strategy,
+                expert_map,
+            )
 
 
 if __name__ == "__main__":
