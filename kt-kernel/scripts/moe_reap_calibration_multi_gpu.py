@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DeepSeek V4 Flash single-process multi-GPU/CPU-offload runner.
+"""MoE REAP calibration multi-GPU/CPU-offload runner.
 
 This runner imports the official DeepSeek V4 inference `model.py` and
 `kernel.py`, but keeps host-specific placement policy in this repository. The
@@ -72,7 +72,27 @@ CPU_MOE_PROFILE: dict[str, float | int] = {
     "active_cpu_expert_hits": 0,
 }
 ROUTING_COUNTS: dict[int, list[int]] = {}
+DOMAIN_ROUTING_COUNTS: dict[str, dict[int, list[int]]] = {}
+ACTIVE_DOMAIN_TAG: str | None = None
 SM86_MXFP4_OPS: Any | None = None
+EVA_DOMAIN_TAGS = [
+    "code-python",
+    "code-rust",
+    "code-typescript",
+    "code-generation",
+    "code-repair",
+    "code-swe",
+    "math-formal",
+    "math-numerical",
+    "math-reasoning",
+    "agentic-tool-use",
+    "roleplay",
+    "creative-writing",
+    "refusal",
+    "instruction-following",
+    "multilingual-zh",
+    "multilingual-en",
+]
 
 
 def _profile_bucket(name: str) -> dict[str, float | int]:
@@ -97,14 +117,20 @@ def _record_fallback_profile(
         bucket["weight_bytes"] = int(bucket["weight_bytes"]) + weight.numel() * weight.element_size()
 
 
-def _record_routing_counts(layer_idx: int | None, counts: list[int]) -> None:
+def _record_counts_into(store: dict[int, list[int]], layer_idx: int | None, counts: list[int]) -> None:
     if layer_idx is None:
         return
-    stored = ROUTING_COUNTS.setdefault(layer_idx, [0] * len(counts))
+    stored = store.setdefault(layer_idx, [0] * len(counts))
     if len(stored) < len(counts):
         stored.extend([0] * (len(counts) - len(stored)))
     for expert_idx, count in enumerate(counts):
         stored[expert_idx] += int(count)
+
+
+def _record_routing_counts(layer_idx: int | None, counts: list[int]) -> None:
+    _record_counts_into(ROUTING_COUNTS, layer_idx, counts)
+    if ACTIVE_DOMAIN_TAG is not None:
+        _record_counts_into(DOMAIN_ROUTING_COUNTS.setdefault(ACTIVE_DOMAIN_TAG, {}), layer_idx, counts)
 
 
 def _install_hadamard_fallback() -> None:
@@ -617,14 +643,48 @@ def _torch_sparse_attn_fallback(
     return result
 
 
+def _torch_hc_split_sinkhorn_fallback(
+    mixes: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    hc_mult: int = 4,
+    sinkhorn_iters: int = 20,
+    eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Torch fallback for DeepSeek V4's HC Sinkhorn TileLang kernel."""
+    started = time.perf_counter()
+    bsz, seqlen, _ = mixes.size()
+    hc = int(hc_mult)
+    flat_mixes = mixes.view(bsz, seqlen, (2 + hc) * hc).float()
+    scale = hc_scale.to(device=mixes.device, dtype=torch.float32)
+    base = hc_base.to(device=mixes.device, dtype=torch.float32)
+
+    pre = torch.sigmoid(flat_mixes[..., :hc] * scale[0] + base[:hc]) + eps
+    post = 2 * torch.sigmoid(flat_mixes[..., hc : 2 * hc] * scale[1] + base[hc : 2 * hc])
+
+    comb = flat_mixes[..., 2 * hc :].view(bsz, seqlen, hc, hc)
+    comb_base = base[2 * hc :].view(hc, hc)
+    comb = comb * scale[2] + comb_base
+    comb = torch.softmax(comb, dim=-1) + eps
+    comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
+    for _ in range(max(0, int(sinkhorn_iters) - 1)):
+        comb = comb / (comb.sum(dim=-1, keepdim=True) + eps)
+        comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
+
+    _record_fallback_profile("hc_split_sinkhorn_torch", time.perf_counter() - started, bsz * seqlen)
+    return pre.to(dtype=mixes.dtype), post.to(dtype=mixes.dtype), comb.to(dtype=mixes.dtype)
+
+
 def _patch_torch_attention_fallback(model_module: Any) -> None:
     model_module.sparse_attn = _torch_sparse_attn_fallback
+    model_module.hc_split_sinkhorn = _torch_hc_split_sinkhorn_fallback
     try:
         import kernel as kernel_module
     except Exception:
         kernel_module = None
     if kernel_module is not None:
         kernel_module.sparse_attn = _torch_sparse_attn_fallback
+        kernel_module.hc_split_sinkhorn = _torch_hc_split_sinkhorn_fallback
 
 
 def _active_expert_indices(
@@ -891,6 +951,9 @@ def patched_moe_forward(self_moe: Any, x: torch.Tensor, input_ids: torch.Tensor)
             out = expert(x_exp.float(), w_exp.float())
             y.index_add_(0, idx, out.to(device=dense_device, dtype=y.dtype))
 
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.all_reduce(y)
+
     shared_device = next(self_moe.shared_experts.parameters()).device
     if shared_device == dense_device:
         y += self_moe.shared_experts(x)
@@ -901,6 +964,26 @@ def patched_moe_forward(self_moe: Any, x: torch.Tensor, input_ids: torch.Tensor)
         out = self_moe.shared_experts(x.to("cpu"))
         y += out.to(dense_device)
     return y.type_as(x).view(shape)
+
+
+def _distributed_runtime() -> tuple[bool, int, int, int]:
+    world_size = int(os.getenv("WORLD_SIZE", "1"))
+    rank = int(os.getenv("RANK", "0"))
+    local_rank = int(os.getenv("LOCAL_RANK", "0"))
+    return world_size > 1, rank, local_rank, world_size
+
+
+def _resolve_checkpoint_file(ckpt_path: Path, rank: int, world_size: int) -> Path:
+    sharded = ckpt_path / f"model{rank}-mp{world_size}.safetensors"
+    if sharded.exists():
+        return sharded
+    single = ckpt_path / "model0-mp1.safetensors"
+    if single.exists():
+        return single
+    raise FileNotFoundError(
+        f"no DeepSeek converted checkpoint shard found under {ckpt_path}; "
+        f"looked for {sharded.name} and {single.name}"
+    )
 
 
 def _patch_kt_cpuinfer_stream_api() -> None:
@@ -1112,7 +1195,7 @@ def _runtime_profile_payload(
             layer_payload["cpu_experts"] += 1
 
     return {
-        "format": "deepseek_v4_flash_runtime_profile_v1",
+        "format": "moe_reap_runtime_profile_v1",
         "placement": {
             "profile": args.placement_profile,
             "gpu_memory_fraction": gpu_memory_fraction,
@@ -1149,6 +1232,57 @@ def _write_runtime_profile(
     )
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(f"\nWrote runtime profile: {path}", flush=True)
+
+
+def _parse_prompt_record(raw_prompt: str) -> tuple[str, str | None]:
+    try:
+        payload = json.loads(raw_prompt)
+    except json.JSONDecodeError:
+        return raw_prompt, None
+    if not isinstance(payload, dict) or "text" not in payload:
+        return raw_prompt, None
+    text = str(payload["text"])
+    raw_domain = payload.get("domain_tag")
+    if raw_domain is None:
+        return text, None
+    domain_tag = str(raw_domain)
+    if domain_tag not in EVA_DOMAIN_TAGS:
+        raise ValueError(f"unknown EVA domain_tag {domain_tag!r}")
+    return text, domain_tag
+
+
+def _write_domain_routing_counts(
+    path: Path,
+    *,
+    num_layers: int,
+    num_experts: int,
+    prompt_source: Path | None,
+) -> None:
+    counts = torch.zeros((num_layers, len(EVA_DOMAIN_TAGS), num_experts), dtype=torch.int64)
+    domain_index = {tag: idx for idx, tag in enumerate(EVA_DOMAIN_TAGS)}
+    for domain_tag, layer_counts in DOMAIN_ROUTING_COUNTS.items():
+        if domain_tag not in domain_index:
+            continue
+        domain_idx = domain_index[domain_tag]
+        for layer_idx, expert_counts in layer_counts.items():
+            if layer_idx < 0 or layer_idx >= num_layers:
+                continue
+            width = min(num_experts, len(expert_counts))
+            counts[layer_idx, domain_idx, :width] += torch.tensor(expert_counts[:width], dtype=torch.int64)
+
+    metadata = {
+        "format": "eva_domain_routing_counts_v1",
+        "source": "moe_reap_calibration_multi_gpu.py",
+        "domain_tags": EVA_DOMAIN_TAGS,
+        "domains_seen": sorted(DOMAIN_ROUTING_COUNTS),
+        "num_layers": num_layers,
+        "num_experts": num_experts,
+        "prompt_source": str(prompt_source) if prompt_source else None,
+        "total_routing_hits": int(counts.sum().item()),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({"counts": counts, "metadata": metadata}, path)
+    print(f"Wrote domain routing counts: {path}", flush=True)
 
 
 def _print_runtime_profile_summary() -> None:
@@ -1199,8 +1333,9 @@ def _load_tokenizer(tokenizer_path: Path) -> Any:
 
     from tokenizers import Tokenizer
 
-    tokenizer_file = tokenizer_path / "tokenizer.json"
-    config_file = tokenizer_path / "tokenizer_config.json"
+    tokenizer_dir = tokenizer_path.parent if tokenizer_path.is_file() else tokenizer_path
+    tokenizer_file = tokenizer_path if tokenizer_path.is_file() else tokenizer_dir / "tokenizer.json"
+    config_file = tokenizer_dir / "tokenizer_config.json"
     raw_tokenizer = Tokenizer.from_file(str(tokenizer_file))
     config = json.loads(config_file.read_text(encoding="utf-8")) if config_file.exists() else {}
     eos_token = _special_token_content(config.get("eos_token")) or "<｜end▁of▁sentence｜>"
@@ -1425,13 +1560,30 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Write fallback timing, CPU MoE, placement, and routing-count profile JSON.",
     )
+    parser.add_argument(
+        "--domain-routing-output",
+        type=Path,
+        help=(
+            "Write EVA-compatible domain routing counts. Stdin prompts may be JSON objects with "
+            "'domain_tag' and 'text' fields."
+        ),
+    )
     return parser.parse_args()
 
 
 def main() -> None:
+    global ACTIVE_DOMAIN_TAG
     args = parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available")
+
+    distributed, rank, local_rank, world_size = _distributed_runtime()
+    if distributed:
+        torch.cuda.set_device(local_rank)
+        torch.distributed.init_process_group("nccl")
+        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+        local_rank = int(os.getenv("LOCAL_RANK", str(local_rank)))
 
     _install_hadamard_fallback()
     sys.path.insert(0, str(args.inference_dir.resolve()))
@@ -1440,15 +1592,19 @@ def main() -> None:
 
     import model as model_module
 
-    model_module.world_size = 1
-    model_module.rank = 0
+    model_module.world_size = world_size
+    model_module.rank = rank
     from encoding_dsv4 import encode_messages, parse_message_from_completion_text
     from model import ModelArgs, MoE, Transformer
 
-    gpu_ids = _parse_gpu_ids(args.gpu_ids)
-    dense_gpu = _auto_dense_gpu(gpu_ids) if args.dense_gpu == "auto" else int(args.dense_gpu)
-    if dense_gpu not in gpu_ids:
-        gpu_ids.append(dense_gpu)
+    if distributed:
+        gpu_ids = [local_rank]
+        dense_gpu = local_rank
+    else:
+        gpu_ids = _parse_gpu_ids(args.gpu_ids)
+        dense_gpu = _auto_dense_gpu(gpu_ids) if args.dense_gpu == "auto" else int(args.dense_gpu)
+        if dense_gpu not in gpu_ids:
+            gpu_ids.append(dense_gpu)
     gpu_memory_fraction, gpu_headroom_gb, expert_placement_strategy = _resolve_placement_policy(args)
     cpuinfer_numa_nodes = _parse_int_csv(args.cpuinfer_numa_nodes)
     kt_capture_batch_sizes = _parse_int_csv(args.kt_capture_batch_sizes)
@@ -1470,7 +1626,10 @@ def main() -> None:
     if torch_attn_fallback:
         _patch_torch_attention_fallback(model_module)
 
-    print(f"GPUs selected: {gpu_ids}")
+    print(
+        f"GPUs selected: {gpu_ids}"
+        + (f" (distributed rank {rank}/{world_size}, local_rank={local_rank})" if distributed else "")
+    )
     int8_tc_gpus = []
     for gid in gpu_ids:
         props = torch.cuda.get_device_properties(gid)
@@ -1552,7 +1711,7 @@ def main() -> None:
         model = Transformer(model_args)
     print(f"  Done in {time.time() - started:.1f}s")
 
-    ckpt_file = args.ckpt_path / "model0-mp1.safetensors"
+    ckpt_file = _resolve_checkpoint_file(args.ckpt_path, rank, world_size)
     print(f"\nLoading weights from {ckpt_file}...")
     started = time.time()
     from safetensors.torch import load_model
@@ -1613,10 +1772,22 @@ def main() -> None:
     messages: list[dict[str, str]] = []
     try:
         while True:
-            try:
-                prompt = input(">>> ")
-            except (EOFError, KeyboardInterrupt):
-                break
+            if distributed:
+                if rank == 0:
+                    try:
+                        prompt = input(">>> ")
+                    except (EOFError, KeyboardInterrupt):
+                        prompt = "/exit"
+                    objects: list[str | None] = [prompt]
+                else:
+                    objects = [None]
+                torch.distributed.broadcast_object_list(objects, src=0)
+                prompt = str(objects[0])
+            else:
+                try:
+                    prompt = input(">>> ")
+                except (EOFError, KeyboardInterrupt):
+                    break
             if prompt == "/exit":
                 break
             if prompt == "/clear":
@@ -1625,24 +1796,30 @@ def main() -> None:
             if not prompt.strip():
                 continue
 
-            messages.append({"role": "user", "content": prompt})
+            prompt_text, domain_tag = _parse_prompt_record(prompt)
+            messages.append({"role": "user", "content": prompt_text})
             prompt_tokens = tokenizer.encode(encode_messages(messages, thinking_mode="chat"))
             print(f"  ({len(prompt_tokens)} prompt tokens)")
 
-            completion_tokens = generate(
-                model,
-                [prompt_tokens],
-                args.max_new_tokens,
-                tokenizer.eos_token_id,
-                dense_device,
-                args.temperature,
-            )
+            ACTIVE_DOMAIN_TAG = domain_tag
+            try:
+                completion_tokens = generate(
+                    model,
+                    [prompt_tokens],
+                    args.max_new_tokens,
+                    tokenizer.eos_token_id,
+                    dense_device,
+                    args.temperature,
+                )
+            finally:
+                ACTIVE_DOMAIN_TAG = None
             completion = tokenizer.decode(completion_tokens[0])
-            print(completion)
+            if rank == 0:
+                print(completion)
             messages.append(parse_message_from_completion_text(completion, thinking_mode="chat"))
     finally:
         _print_runtime_profile_summary()
-        if args.profile_output is not None:
+        if args.profile_output is not None and rank == 0:
             _write_runtime_profile(
                 args.profile_output,
                 args,
@@ -1651,6 +1828,19 @@ def main() -> None:
                 expert_placement_strategy,
                 expert_map,
             )
+        if (
+            args.domain_routing_output is not None
+            and rank == 0
+            and "model_args" in locals()
+        ):
+            _write_domain_routing_counts(
+                args.domain_routing_output,
+                num_layers=model_args.n_layers,
+                num_experts=model_args.n_routed_experts,
+                prompt_source=None,
+            )
+        if distributed and torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":

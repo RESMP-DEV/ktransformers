@@ -1,4 +1,4 @@
-"""Static coverage for the DeepSeek V4 Flash debug runner helpers."""
+"""Static coverage for the MoE REAP calibration runner helpers."""
 
 from __future__ import annotations
 
@@ -12,8 +12,8 @@ import torch
 
 
 def _load_runner_module():
-    script = Path(__file__).resolve().parents[1] / "scripts" / "deepseek_v4_flash_multi_gpu.py"
-    spec = importlib.util.spec_from_file_location("deepseek_v4_flash_multi_gpu", script)
+    script = Path(__file__).resolve().parents[1] / "scripts" / "moe_reap_calibration_multi_gpu.py"
+    spec = importlib.util.spec_from_file_location("moe_reap_calibration_multi_gpu", script)
     assert spec is not None
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -69,6 +69,66 @@ def test_active_cpu_expert_detection_respects_gpu_mask():
     assert runner._has_active_cpu_expert(counts, gpu_mask)
 
 
+def test_hc_split_sinkhorn_torch_fallback_shapes_and_normalizes():
+    runner = _load_runner_module()
+    torch.manual_seed(0)
+    mixes = torch.randn(2, 3, 24)
+    scale = torch.tensor([0.5, 0.25, 0.75], dtype=torch.float32)
+    base = torch.randn(24)
+
+    pre, post, comb = runner._torch_hc_split_sinkhorn_fallback(
+        mixes,
+        scale,
+        base,
+        hc_mult=4,
+        sinkhorn_iters=20,
+        eps=1e-6,
+    )
+
+    assert pre.shape == (2, 3, 4)
+    assert post.shape == (2, 3, 4)
+    assert comb.shape == (2, 3, 4, 4)
+    assert torch.all(pre > 0)
+    assert torch.all(post >= 0)
+    torch.testing.assert_close(comb.sum(dim=-1), torch.ones(2, 3, 4), rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(comb.sum(dim=-2), torch.ones(2, 3, 4), rtol=1e-4, atol=1e-4)
+
+
+def test_parse_prompt_record_accepts_domain_json():
+    runner = _load_runner_module()
+
+    text, domain = runner._parse_prompt_record('{"domain_tag":"code-python","text":"write code"}')
+
+    assert text == "write code"
+    assert domain == "code-python"
+    assert runner._parse_prompt_record("plain prompt") == ("plain prompt", None)
+
+
+def test_write_domain_routing_counts_outputs_eva_tensor(tmp_path):
+    runner = _load_runner_module()
+    runner.DOMAIN_ROUTING_COUNTS.clear()
+    runner.DOMAIN_ROUTING_COUNTS["code-python"] = {0: [1, 2, 0], 1: [0, 1, 3]}
+    runner.DOMAIN_ROUTING_COUNTS["instruction-following"] = {0: [4, 0, 1]}
+    output = tmp_path / "counts.pt"
+
+    runner._write_domain_routing_counts(
+        output,
+        num_layers=2,
+        num_experts=3,
+        prompt_source=None,
+    )
+
+    saved = torch.load(output, map_location="cpu", weights_only=False)
+    counts = saved["counts"]
+    code_idx = runner.EVA_DOMAIN_TAGS.index("code-python")
+    inst_idx = runner.EVA_DOMAIN_TAGS.index("instruction-following")
+    assert counts.shape == (2, len(runner.EVA_DOMAIN_TAGS), 3)
+    assert counts[0, code_idx].tolist() == [1, 2, 0]
+    assert counts[1, code_idx].tolist() == [0, 1, 3]
+    assert counts[0, inst_idx].tolist() == [4, 0, 1]
+    assert saved["metadata"]["total_routing_hits"] == 12
+
+
 def test_cpuinfer_thread_auto_uses_physical_core_count(monkeypatch):
     runner = _load_runner_module()
     monkeypatch.setattr(runner, "_physical_core_count", lambda: 24)
@@ -83,7 +143,7 @@ def test_activation_profile_loads_runtime_routing_counts(tmp_path):
     profile.write_text(
         json.dumps(
             {
-                "format": "deepseek_v4_flash_runtime_profile_v1",
+                "format": "moe_reap_runtime_profile_v1",
                 "routing": {
                     "layers": [
                         {"layer": 0, "expert_counts": [0, 3, 9]},
