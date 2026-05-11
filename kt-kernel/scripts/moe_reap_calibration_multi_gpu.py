@@ -66,11 +66,39 @@ PLACEMENT_PROFILES: dict[str, dict[str, float | str]] = {
     },
 }
 FALLBACK_PROFILE: dict[str, dict[str, float | int]] = {}
-CPU_MOE_PROFILE: dict[str, float | int] = {
+CPU_MOE_PROFILE: dict[str, Any] = {
     "submitted_calls": 0,
     "skipped_calls": 0,
     "active_cpu_expert_hits": 0,
+    "cpuinfer_submit_calls": 0,
+    "cpuinfer_deferred_submit_calls": 0,
+    "stream_api": "uninitialized",
+    "phase_seconds": {},
+    "phase_calls": {},
+    "native_phase_visibility": {
+        "gate_up": "inside_cpuinfer_forward_task",
+        "activation": "inside_cpuinfer_forward_task",
+        "down": "inside_cpuinfer_forward_task",
+        "weighting": "inside_cpuinfer_forward_task",
+    },
 }
+SMOOTHQUANT_PROFILE: dict[str, Any] = {
+    "enabled": False,
+    "manifest": None,
+    "scheme": None,
+    "manifest_entries": 0,
+    "attached_tensors": 0,
+    "shape_mismatches": 0,
+    "linear_calls": 0,
+    "loaded_tensors": 0,
+}
+INT8_ARTIFACT_MANIFESTS = {
+    "int8-smoothquant": ("w8a8_smoothquant", "smoothquant-int8-manifest.json"),
+    "int8-mr-gptq": ("w8a8_mr_gptq_int8", "mr-gptq-int8-manifest.json"),
+}
+ACTIVATION_STATS_ENABLED = False
+ACTIVATION_AMAX: dict[str, torch.Tensor] = {}
+ACTIVATION_TOKENS: dict[str, int] = {}
 ROUTING_COUNTS: dict[int, list[int]] = {}
 DOMAIN_ROUTING_COUNTS: dict[str, dict[int, list[int]]] = {}
 ACTIVE_DOMAIN_TAG: str | None = None
@@ -115,6 +143,64 @@ def _record_fallback_profile(
     bucket["tokens"] = int(bucket["tokens"]) + tokens
     if weight is not None:
         bucket["weight_bytes"] = int(bucket["weight_bytes"]) + weight.numel() * weight.element_size()
+
+
+def _record_cpu_moe_phase(name: str, elapsed: float, calls: int = 1) -> None:
+    phase_seconds = CPU_MOE_PROFILE.setdefault("phase_seconds", {})
+    phase_calls = CPU_MOE_PROFILE.setdefault("phase_calls", {})
+    phase_seconds[name] = float(phase_seconds.get(name, 0.0)) + elapsed
+    phase_calls[name] = int(phase_calls.get(name, 0)) + calls
+
+
+def _record_activation_amax(weight: torch.Tensor, x: torch.Tensor) -> None:
+    if not ACTIVATION_STATS_ENABLED:
+        return
+    name = getattr(weight, "_eva_param_name", None)
+    if not isinstance(name, str) or weight.ndim != 2:
+        return
+    if x.shape[-1] != weight.shape[1]:
+        return
+    flat = x.reshape(-1, x.shape[-1])
+    amax = flat.detach().abs().float().amax(dim=0).cpu()
+    previous = ACTIVATION_AMAX.get(name)
+    ACTIVATION_AMAX[name] = amax if previous is None else torch.maximum(previous, amax)
+    ACTIVATION_TOKENS[name] = ACTIVATION_TOKENS.get(name, 0) + int(flat.shape[0])
+
+
+def _check_power_of_two(value: int, name: str) -> None:
+    if value <= 0 or value & (value - 1):
+        raise ValueError(f"{name} must be a positive power of two, got {value}")
+
+
+def _normalized_hadamard(size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    _check_power_of_two(size, "Hadamard size")
+    h = torch.ones((1, 1), device=device, dtype=dtype)
+    while h.shape[0] < size:
+        h = torch.cat(
+            (
+                torch.cat((h, h), dim=1),
+                torch.cat((h, -h), dim=1),
+            ),
+            dim=0,
+        )
+    return h / (float(size) ** 0.5)
+
+
+def _apply_block_hadamard(x: torch.Tensor, block_size: int) -> torch.Tensor:
+    _check_power_of_two(block_size, "rotation_block_size")
+    if x.shape[-1] < block_size:
+        return x.clone()
+    original_shape = x.shape
+    x_2d = x.reshape(-1, original_shape[-1])
+    full_width = (x_2d.shape[-1] // block_size) * block_size
+    head = x_2d[:, :full_width]
+    tail = x_2d[:, full_width:]
+    blocks = head.reshape(-1, full_width // block_size, block_size)
+    rotated = torch.matmul(blocks, _normalized_hadamard(block_size, x.device, x.dtype))
+    rotated = rotated.reshape(x_2d.shape[0], full_width)
+    if tail.numel():
+        rotated = torch.cat((rotated, tail.clone()), dim=-1)
+    return rotated.reshape(original_shape)
 
 
 def _record_counts_into(store: dict[int, list[int]], layer_idx: int | None, counts: list[int]) -> None:
@@ -366,6 +452,204 @@ def _select_gpu_fp8_backend(
     return "torch"
 
 
+class SmoothQuantArtifactStore:
+    """Lazy loader for W8A8 INT8 tensors generated from safetensors weights."""
+
+    def __init__(self, manifest_path: Path, expected_scheme: str | None = None) -> None:
+        self.manifest_path = manifest_path
+        self.root = manifest_path.parent
+        self.manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.scheme = str(self.manifest.get("scheme"))
+        supported_schemes = {scheme for scheme, _manifest in INT8_ARTIFACT_MANIFESTS.values()}
+        if expected_scheme is not None and self.scheme != expected_scheme:
+            raise ValueError(
+                f"INT8 manifest scheme mismatch in {manifest_path}: expected {expected_scheme!r}, got {self.scheme!r}"
+            )
+        if self.scheme not in supported_schemes:
+            raise ValueError(
+                f"Unsupported INT8 artifact scheme in {manifest_path}: {self.manifest.get('scheme')!r}"
+            )
+        self.entries: dict[str, dict[str, Any]] = {}
+        self._tensor_cache: dict[tuple[str, str, str], torch.Tensor] = {}
+        for file_entry in self.manifest.get("files", []):
+            artifact = Path(str(file_entry.get("artifact", "")))
+            if not artifact.is_absolute():
+                artifact = self.root / artifact
+            for tensor_entry in file_entry.get("tensors", []):
+                source = str(tensor_entry["source"])
+                self.entries[source] = {
+                    "artifact": artifact,
+                    "scheme": self.scheme,
+                    "qweight": str(tensor_entry["qweight"]),
+                    "weight_scale": str(tensor_entry["weight_scale"]),
+                    "smooth_scale": str(tensor_entry["smooth_scale"]) if tensor_entry.get("smooth_scale") else None,
+                    "activation_order": (
+                        str(tensor_entry["activation_order"]) if tensor_entry.get("activation_order") else None
+                    ),
+                    "hessian_diag": str(tensor_entry["hessian_diag"]) if tensor_entry.get("hessian_diag") else None,
+                    "rotation": tensor_entry.get("rotation"),
+                    "shape": tuple(int(v) for v in tensor_entry.get("shape", ())),
+                }
+        if not self.entries:
+            raise ValueError(f"INT8 artifact manifest contains no tensor entries: {manifest_path}")
+
+    def lookup(self, parameter_name: str) -> dict[str, Any] | None:
+        for candidate in _smoothquant_name_candidates(parameter_name):
+            entry = self.entries.get(candidate)
+            if entry is not None:
+                return entry
+        return None
+
+    def tensor(self, artifact: Path, key: str, device: torch.device) -> torch.Tensor:
+        cache_key = (str(artifact), key, str(device))
+        cached = self._tensor_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        if not artifact.exists():
+            raise FileNotFoundError(f"INT8 artifact not found: {artifact}")
+        from safetensors import safe_open
+
+        with safe_open(artifact, framework="pt", device="cpu") as reader:
+            if key not in reader.keys():
+                raise KeyError(f"INT8 artifact tensor {key!r} not found in {artifact}")
+            tensor = reader.get_tensor(key)
+        tensor = tensor.to(device=device, non_blocking=True)
+        self._tensor_cache[cache_key] = tensor
+        SMOOTHQUANT_PROFILE["loaded_tensors"] = int(SMOOTHQUANT_PROFILE["loaded_tensors"]) + 1
+        return tensor
+
+    def tensors_for(
+        self,
+        entry: dict[str, Any],
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        artifact = Path(entry["artifact"])
+        qweight = self.tensor(artifact, str(entry["qweight"]), device)
+        weight_scale = self.tensor(artifact, str(entry["weight_scale"]), device).float()
+        smooth_key = entry.get("smooth_scale")
+        if smooth_key is None:
+            smooth_scale = torch.empty(0, device=device, dtype=torch.float32)
+        else:
+            smooth_scale = self.tensor(artifact, str(smooth_key), device).float()
+        return qweight, weight_scale, smooth_scale
+
+
+def _smoothquant_name_candidates(parameter_name: str) -> list[str]:
+    candidates = [parameter_name]
+    if parameter_name.startswith("model."):
+        candidates.append(parameter_name.removeprefix("model."))
+    else:
+        candidates.append(f"model.{parameter_name}")
+    if parameter_name.startswith("module."):
+        stripped = parameter_name.removeprefix("module.")
+        candidates.append(stripped)
+        candidates.append(f"model.{stripped}")
+    return candidates
+
+
+def _attach_smoothquant_int8_artifacts(model: Any, store: SmoothQuantArtifactStore) -> dict[str, int]:
+    stats = {"attached_tensors": 0, "shape_mismatches": 0, "manifest_entries": len(store.entries)}
+    for name, param in model.named_parameters():
+        if param.ndim != 2:
+            continue
+        entry = store.lookup(name)
+        if entry is None:
+            continue
+        expected_shape = tuple(entry.get("shape", ()))
+        if expected_shape and expected_shape != tuple(param.shape):
+            stats["shape_mismatches"] += 1
+            continue
+        param._eva_smoothquant_store = store
+        param._eva_smoothquant_entry = entry
+        stats["attached_tensors"] += 1
+
+    SMOOTHQUANT_PROFILE["enabled"] = True
+    SMOOTHQUANT_PROFILE["manifest"] = str(store.manifest_path)
+    SMOOTHQUANT_PROFILE["scheme"] = store.scheme
+    SMOOTHQUANT_PROFILE["manifest_entries"] = stats["manifest_entries"]
+    SMOOTHQUANT_PROFILE["attached_tensors"] = stats["attached_tensors"]
+    SMOOTHQUANT_PROFILE["shape_mismatches"] = stats["shape_mismatches"]
+    if stats["attached_tensors"] == 0:
+        raise RuntimeError(
+            "INT8 artifacts were valid, but none of the manifest tensor names matched model parameters"
+        )
+    return stats
+
+
+def _expand_int8_weight_scale(
+    weight_scale: torch.Tensor,
+    qweight_shape: tuple[int, int],
+    rotation_block_size: int | None,
+) -> torch.Tensor:
+    if weight_scale.ndim == 1:
+        if weight_scale.numel() != qweight_shape[0]:
+            raise RuntimeError(
+                "INT8 row scale length does not match output dimension: "
+                f"{weight_scale.numel()} != {qweight_shape[0]}"
+            )
+        return weight_scale.reshape(-1, 1)
+    if weight_scale.ndim != 2 or weight_scale.shape[0] != qweight_shape[0]:
+        raise RuntimeError(
+            "INT8 weight_scale must be [out] or [out, groups], got "
+            f"shape={tuple(weight_scale.shape)} for qweight={qweight_shape}"
+        )
+    if rotation_block_size is None:
+        if weight_scale.shape[1] != 1:
+            raise RuntimeError("INT8 grouped scales require rotation_block_size metadata")
+        return weight_scale
+    expanded = weight_scale.repeat_interleave(rotation_block_size, dim=1)
+    return expanded[:, : qweight_shape[1]]
+
+
+def _int8_artifact_profile_name(weight: torch.Tensor) -> str:
+    entry = getattr(weight, "_eva_smoothquant_entry", None)
+    if isinstance(entry, dict) and entry.get("scheme") == "w8a8_mr_gptq_int8":
+        return "linear_int8_mr_gptq"
+    return "linear_int8_smoothquant"
+
+
+def _smoothquant_int8_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    output_dtype: torch.dtype,
+) -> torch.Tensor | None:
+    store = getattr(weight, "_eva_smoothquant_store", None)
+    entry = getattr(weight, "_eva_smoothquant_entry", None)
+    if store is None or entry is None:
+        return None
+
+    compute_device = x.device if x.device.type == "cuda" else weight.device
+    qweight, weight_scale, smooth_scale = store.tensors_for(entry, compute_device)
+    if qweight.ndim != 2:
+        raise RuntimeError(f"SmoothQuant qweight must be 2D, got shape={tuple(qweight.shape)}")
+    if qweight.shape != weight.shape:
+        raise RuntimeError(
+            f"SmoothQuant qweight shape does not match model weight: {tuple(qweight.shape)} != {tuple(weight.shape)}"
+        )
+    if smooth_scale.numel() not in (0, qweight.shape[1]):
+        raise RuntimeError(
+            "SmoothQuant smooth_scale width does not match input dimension: "
+            f"{smooth_scale.numel()} != {qweight.shape[1]}"
+        )
+
+    original_shape = x.shape[:-1]
+    x_2d = x.reshape(-1, x.shape[-1]).to(device=compute_device, dtype=torch.float32)
+    if smooth_scale.numel():
+        x_2d = x_2d / smooth_scale.reshape(1, -1).clamp_min(1e-12)
+        rotation_block_size = None
+    else:
+        rotation = entry.get("rotation") if isinstance(entry, dict) else None
+        rotation_block_size = None
+        if isinstance(rotation, dict) and rotation.get("type") == "block_hadamard":
+            rotation_block_size = int(rotation["block_size"])
+            x_2d = _apply_block_hadamard(x_2d, rotation_block_size)
+    scale = _expand_int8_weight_scale(weight_scale, tuple(qweight.shape), rotation_block_size)
+    weight_f = qweight.to(dtype=torch.float32) * scale
+    SMOOTHQUANT_PROFILE["linear_calls"] = int(SMOOTHQUANT_PROFILE["linear_calls"]) + 1
+    y = functional.linear(x_2d, weight_f)
+    return y.reshape(*original_shape, y.shape[-1]).to(device=x.device, dtype=output_dtype)
+
+
 def _resolve_placement_policy(args: argparse.Namespace) -> tuple[float, float, str]:
     profile_name = "conservative" if args.placement_profile == "custom" else args.placement_profile
     profile = PLACEMENT_PROFILES[profile_name]
@@ -529,7 +813,13 @@ def _torch_fp4_act_quant(
     return x.contiguous(), scale
 
 
-def _patch_torch_quant_fallback(model_module: Any, gpu_fp4_backend: str, gpu_fp8_backend: str) -> None:
+def _patch_torch_quant_fallback(
+    model_module: Any,
+    gpu_fp4_backend: str,
+    gpu_fp8_backend: str,
+    *,
+    enable_quant_fallback: bool = True,
+) -> None:
     original_linear = model_module.linear
 
     def fallback_linear(
@@ -538,7 +828,18 @@ def _patch_torch_quant_fallback(model_module: Any, gpu_fp4_backend: str, gpu_fp8
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         assert bias is None
-        if weight.dtype == FP8_DTYPE:
+        _record_activation_amax(weight, x)
+        smoothquant_started = time.perf_counter()
+        smoothquant_result = _smoothquant_int8_linear(x, weight, x.dtype)
+        if smoothquant_result is not None:
+            _record_fallback_profile(
+                _int8_artifact_profile_name(weight),
+                time.perf_counter() - smoothquant_started,
+                x.numel() // x.size(-1),
+                weight,
+            )
+            return smoothquant_result
+        if enable_quant_fallback and weight.dtype == FP8_DTYPE:
             started = time.perf_counter()
             output_device = x.device
             output_dtype = x.dtype
@@ -559,7 +860,7 @@ def _patch_torch_quant_fallback(model_module: Any, gpu_fp4_backend: str, gpu_fp8
             result = y.to(device=output_device, dtype=output_dtype)
             _record_fallback_profile("linear_fp8", time.perf_counter() - started, x.numel() // x.size(-1), weight)
             return result
-        if weight.dtype == FP4_DTYPE:
+        if enable_quant_fallback and weight.dtype == FP4_DTYPE:
             started = time.perf_counter()
             output_device = x.device
             output_dtype = x.dtype
@@ -583,15 +884,16 @@ def _patch_torch_quant_fallback(model_module: Any, gpu_fp4_backend: str, gpu_fp8
         return original_linear(x, weight, bias)
 
     model_module.linear = fallback_linear
-    model_module.act_quant = _torch_act_quant
-    model_module.fp4_act_quant = _torch_fp4_act_quant
-    try:
-        import kernel as kernel_module
-    except Exception:
-        kernel_module = None
-    if kernel_module is not None:
-        kernel_module.act_quant = _torch_act_quant
-        kernel_module.fp4_act_quant = _torch_fp4_act_quant
+    if enable_quant_fallback:
+        model_module.act_quant = _torch_act_quant
+        model_module.fp4_act_quant = _torch_fp4_act_quant
+        try:
+            import kernel as kernel_module
+        except Exception:
+            kernel_module = None
+        if kernel_module is not None:
+            kernel_module.act_quant = _torch_act_quant
+            kernel_module.fp4_act_quant = _torch_fp4_act_quant
 
 
 def _torch_sparse_attn_fallback(
@@ -884,8 +1186,31 @@ def _move_dense_weights(
             param.data = param.data.to(dense_device, non_blocking=True)
             gpu_bytes += param.numel() * param.element_size()
     for _, buf in model.named_buffers():
-        buf.data = buf.data.to(dense_device, non_blocking=True)
+            buf.data = buf.data.to(dense_device, non_blocking=True)
     return gpu_bytes, cpu_bytes
+
+
+def _annotate_parameter_names(model: Any) -> None:
+    for name, param in model.named_parameters():
+        param._eva_param_name = name
+
+
+def _write_activation_stats(path: Path) -> None:
+    tensors = {
+        name: {
+            "amax": ACTIVATION_AMAX[name].tolist(),
+            "tokens": ACTIVATION_TOKENS.get(name, 0),
+        }
+        for name in sorted(ACTIVATION_AMAX)
+    }
+    payload = {
+        "format": "eva_linear_activation_amax_v1",
+        "source": "moe_reap_calibration_multi_gpu.py",
+        "tensors": tensors,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(f"Wrote activation stats: {path} ({len(tensors)} tensors)", flush=True)
 
 
 def patched_moe_forward(self_moe: Any, x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
@@ -893,8 +1218,11 @@ def patched_moe_forward(self_moe: Any, x: torch.Tensor, input_ids: torch.Tensor)
     shape = x.size()
     dense_device = x.device
     x = x.view(-1, self_moe.dim)
+    started = time.perf_counter()
     weights, indices = self_moe.gate(x, input_ids.flatten())
+    _record_cpu_moe_phase("router_gate", time.perf_counter() - started)
     y = torch.zeros_like(x, dtype=torch.float32)
+    started = time.perf_counter()
     counts = torch.bincount(indices.flatten(), minlength=self_moe.n_routed_experts).tolist()
     layer_idx = getattr(self_moe, "_eva_layer_idx", None)
     _record_routing_counts(layer_idx, counts)
@@ -903,6 +1231,7 @@ def patched_moe_forward(self_moe: Any, x: torch.Tensor, input_ids: torch.Tensor)
         self_moe.experts_start_idx,
         self_moe.experts_end_idx,
     )
+    _record_cpu_moe_phase("routing_accounting", time.perf_counter() - started)
     kt_cpu_moe = getattr(self_moe, "_kt_cpu_moe", None)
 
     if kt_cpu_moe is not None:
@@ -919,11 +1248,17 @@ def patched_moe_forward(self_moe: Any, x: torch.Tensor, input_ids: torch.Tensor)
                 cuda_stream = torch.cuda.current_stream(dense_device).cuda_stream
             else:
                 cuda_stream = 0
+            started = time.perf_counter()
             cpu_out = kt_cpu_moe.forward(x, indices, weights, cuda_stream)
+            _record_cpu_moe_phase("native_fused_total", time.perf_counter() - started)
+            started = time.perf_counter()
             y += cpu_out.to(device=dense_device, dtype=y.dtype)
+            _record_cpu_moe_phase("cpu_output_merge", time.perf_counter() - started)
         else:
             CPU_MOE_PROFILE["skipped_calls"] = int(CPU_MOE_PROFILE["skipped_calls"]) + 1
 
+    gpu_expert_started = time.perf_counter()
+    ran_gpu_or_torch_experts = False
     for expert_idx in active_experts:
         expert = self_moe.experts[expert_idx]
         if expert is None:
@@ -931,6 +1266,7 @@ def patched_moe_forward(self_moe: Any, x: torch.Tensor, input_ids: torch.Tensor)
         expert_device = next(expert.parameters()).device
         if kt_cpu_moe is not None and expert_device.type == "cpu":
             continue
+        ran_gpu_or_torch_experts = True
         idx, top = torch.where(indices == expert_idx)
 
         if expert_device == dense_device:
@@ -950,11 +1286,16 @@ def patched_moe_forward(self_moe: Any, x: torch.Tensor, input_ids: torch.Tensor)
             w_exp = weights[idx, top, None].to("cpu")
             out = expert(x_exp.float(), w_exp.float())
             y.index_add_(0, idx, out.to(device=dense_device, dtype=y.dtype))
+    if ran_gpu_or_torch_experts:
+        _record_cpu_moe_phase("gpu_or_torch_experts", time.perf_counter() - gpu_expert_started)
 
     if torch.distributed.is_available() and torch.distributed.is_initialized():
+        started = time.perf_counter()
         torch.distributed.all_reduce(y)
+        _record_cpu_moe_phase("distributed_all_reduce", time.perf_counter() - started)
 
     shared_device = next(self_moe.shared_experts.parameters()).device
+    started = time.perf_counter()
     if shared_device == dense_device:
         y += self_moe.shared_experts(x)
     elif shared_device.type == "cuda":
@@ -963,6 +1304,7 @@ def patched_moe_forward(self_moe: Any, x: torch.Tensor, input_ids: torch.Tensor)
     else:
         out = self_moe.shared_experts(x.to("cpu"))
         y += out.to(dense_device)
+    _record_cpu_moe_phase("shared_experts", time.perf_counter() - started)
     return y.type_as(x).view(shape)
 
 
@@ -1090,6 +1432,153 @@ def _patch_kt_cpuinfer_stream_api() -> None:
     print("[kt-mxfp4] patched CPUInfer submit/sync stream compatibility", flush=True)
 
 
+def _install_kt_cpu_moe_profile_hooks() -> None:
+    """Install Python-side CPUInfer phase timing without changing native kernels."""
+    from kt_kernel import _kt_kernel_ext, experts_base
+
+    base_cls = experts_base.BaseMoEWrapper
+    if getattr(base_cls, "_eva_cpu_moe_profile_hooks", False):
+        return
+
+    stream_aware = hasattr(_kt_kernel_ext.CPUInfer, "submit_with_cuda_stream")
+    CPU_MOE_PROFILE["stream_api"] = "stream-aware" if stream_aware else "compat-no-stream"
+
+    def _submit_task(cpu_infer: Any, cuda_stream: Any, task: Any) -> None:
+        if hasattr(cpu_infer, "submit_with_cuda_stream"):
+            cpu_infer.submit_with_cuda_stream(cuda_stream, task)
+        else:
+            cpu_infer.submit(task)
+
+    def _sync_task(cpu_infer: Any, cuda_stream: Any, allow_pending: int) -> None:
+        if hasattr(cpu_infer, "sync_with_cuda_stream"):
+            cpu_infer.sync_with_cuda_stream(cuda_stream, allow_pending)
+            return
+        try:
+            cpu_infer.sync(allow_pending)
+        except TypeError:
+            cpu_infer.sync()
+
+    def submit_forward(
+        self: Any,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        cuda_stream: Any,
+    ) -> None:
+        flat_hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+
+        started = time.perf_counter()
+        (
+            input_tensor_cpu,
+            immediate_experts_ids_cpu,
+            deferred_experts_ids_cpu,
+            weights_cpu,
+            output_cpu,
+            bsz_tensor_cpu,
+            _output_gpu,
+        ) = experts_base.KExpertsCPUBuffer.get_buffer(flat_hidden_states, self.num_experts_per_tok)
+        _record_cpu_moe_phase("buffer_lookup", time.perf_counter() - started)
+
+        current_slot = self.layer_idx % experts_base.KExpertsCPUBuffer.buffer_depth
+        next_slot = (current_slot + 1) % experts_base.KExpertsCPUBuffer.buffer_depth
+        bsz_slot_tensor = bsz_tensor_cpu[current_slot]
+
+        started = time.perf_counter()
+        topk_ids_long = topk_ids.to(torch.long)
+        if self.max_deferred_experts_per_token > 0:
+            protected_k = self.num_experts_per_tok - self.max_deferred_experts_per_token
+            immediate_ids, deferred_ids = self.select_deferred_experts(topk_ids_long, topk_weights, protected_k)
+        else:
+            immediate_ids = topk_ids_long
+            deferred_ids = None
+        _record_cpu_moe_phase("select_deferred", time.perf_counter() - started)
+
+        started = time.perf_counter()
+        input_tensor_cpu[current_slot].copy_(flat_hidden_states, non_blocking=True)
+        weights_cpu[current_slot].copy_(topk_weights, non_blocking=True)
+        immediate_experts_ids_cpu[current_slot].copy_(immediate_ids, non_blocking=True)
+        if not stream_aware and hidden_states.device.type == "cuda":
+            torch.cuda.current_stream(hidden_states.device).synchronize()
+        _record_cpu_moe_phase("d2h_input_copy_submit", time.perf_counter() - started)
+
+        incremental = base_cls._layer_has_pending_deferred.get(self.layer_idx - 1, False)
+        started = time.perf_counter()
+        _submit_task(
+            self.cpu_infer,
+            cuda_stream,
+            self.moe.forward_task(
+                bsz_slot_tensor.data_ptr(),
+                immediate_experts_ids_cpu[current_slot].size(-1),
+                immediate_experts_ids_cpu[current_slot].data_ptr(),
+                weights_cpu[current_slot].data_ptr(),
+                input_tensor_cpu[current_slot].data_ptr(),
+                output_cpu[current_slot].data_ptr(),
+                incremental,
+            ),
+        )
+        CPU_MOE_PROFILE["cpuinfer_submit_calls"] = int(CPU_MOE_PROFILE["cpuinfer_submit_calls"]) + 1
+        _record_cpu_moe_phase("cpuinfer_submit", time.perf_counter() - started)
+
+        base_cls._layer_has_pending_deferred[self.layer_idx] = False
+        if deferred_ids is not None:
+            started = time.perf_counter()
+            deferred_experts_ids_cpu[current_slot].copy_(deferred_ids, non_blocking=True)
+            if not stream_aware and hidden_states.device.type == "cuda":
+                torch.cuda.current_stream(hidden_states.device).synchronize()
+            _record_cpu_moe_phase("d2h_deferred_ids_copy", time.perf_counter() - started)
+
+            started = time.perf_counter()
+            _submit_task(
+                self.cpu_infer,
+                cuda_stream,
+                self.moe.forward_task(
+                    bsz_slot_tensor.data_ptr(),
+                    deferred_experts_ids_cpu[current_slot].size(-1),
+                    deferred_experts_ids_cpu[current_slot].data_ptr(),
+                    weights_cpu[current_slot].data_ptr(),
+                    input_tensor_cpu[current_slot].data_ptr(),
+                    output_cpu[next_slot].data_ptr(),
+                    False,
+                ),
+            )
+            CPU_MOE_PROFILE["cpuinfer_submit_calls"] = int(CPU_MOE_PROFILE["cpuinfer_submit_calls"]) + 1
+            CPU_MOE_PROFILE["cpuinfer_deferred_submit_calls"] = (
+                int(CPU_MOE_PROFILE["cpuinfer_deferred_submit_calls"]) + 1
+            )
+            _record_cpu_moe_phase("cpuinfer_submit_deferred", time.perf_counter() - started)
+            base_cls._layer_has_pending_deferred[self.layer_idx] = True
+
+    def sync_forward(self: Any, hidden_states: torch.Tensor, cuda_stream: Any) -> torch.Tensor:
+        flat_hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+
+        started = time.perf_counter()
+        (
+            _input_tensor_cpu,
+            _immediate_experts_ids_cpu,
+            _deferred_experts_ids_cpu,
+            _weights_cpu,
+            output_cpu,
+            _bsz_tensor_cpu,
+            output_gpu,
+        ) = experts_base.KExpertsCPUBuffer.get_buffer(flat_hidden_states, self.num_experts_per_tok)
+        _record_cpu_moe_phase("buffer_lookup_sync", time.perf_counter() - started)
+
+        current_slot = self.layer_idx % experts_base.KExpertsCPUBuffer.buffer_depth
+        allow_pending = 1 if base_cls._layer_has_pending_deferred.get(self.layer_idx, False) else 0
+        started = time.perf_counter()
+        _sync_task(self.cpu_infer, cuda_stream, allow_pending)
+        _record_cpu_moe_phase("cpuinfer_sync", time.perf_counter() - started)
+
+        started = time.perf_counter()
+        output_gpu[current_slot].copy_(output_cpu[current_slot], non_blocking=True)
+        _record_cpu_moe_phase("h2d_output_copy", time.perf_counter() - started)
+        return output_gpu[current_slot]
+
+    base_cls.submit_forward = submit_forward
+    base_cls.sync_forward = sync_forward
+    base_cls._eva_cpu_moe_profile_hooks = True
+
+
 def _attach_kt_mxfp4_cpu_moe(
     model: Any,
     ckpt_file: Path,
@@ -1105,6 +1594,7 @@ def _attach_kt_mxfp4_cpu_moe(
     from kt_kernel import KTMoEWrapper
 
     _patch_kt_cpuinfer_stream_api()
+    _install_kt_cpu_moe_profile_hooks()
     if kt_capture_batch_sizes:
         KTMoEWrapper.set_capture_batch_sizes(kt_capture_batch_sizes)
         print(f"  [kt-mxfp4] capture_batch_sizes={kt_capture_batch_sizes}", flush=True)
@@ -1208,6 +1698,8 @@ def _runtime_profile_payload(
         },
         "fallback": FALLBACK_PROFILE,
         "cpu_moe": CPU_MOE_PROFILE,
+        "smoothquant": SMOOTHQUANT_PROFILE,
+        "int8_artifacts": SMOOTHQUANT_PROFILE,
         "routing": {
             "layers": routing_layers,
         },
@@ -1302,9 +1794,32 @@ def _print_runtime_profile_summary() -> None:
         "CPU MoE profile: "
         f"submitted_calls={CPU_MOE_PROFILE['submitted_calls']}, "
         f"skipped_calls={CPU_MOE_PROFILE['skipped_calls']}, "
-        f"active_cpu_expert_hits={CPU_MOE_PROFILE['active_cpu_expert_hits']}",
+        f"active_cpu_expert_hits={CPU_MOE_PROFILE['active_cpu_expert_hits']}, "
+        f"cpuinfer_submit_calls={CPU_MOE_PROFILE['cpuinfer_submit_calls']}, "
+        f"stream_api={CPU_MOE_PROFILE['stream_api']}",
         flush=True,
     )
+    phase_seconds = CPU_MOE_PROFILE.get("phase_seconds", {})
+    phase_calls = CPU_MOE_PROFILE.get("phase_calls", {})
+    if phase_seconds:
+        print("CPU MoE phase profile:", flush=True)
+        for name in sorted(phase_seconds):
+            seconds = float(phase_seconds[name])
+            calls = int(phase_calls.get(name, 0))
+            print(
+                f"  {name}: calls={calls}, seconds={seconds:.3f}, "
+                f"ms_per_call={seconds * 1000 / max(calls, 1):.2f}",
+                flush=True,
+            )
+    if SMOOTHQUANT_PROFILE["enabled"]:
+        print(
+            "INT8 artifact profile: "
+            f"scheme={SMOOTHQUANT_PROFILE['scheme']}, "
+            f"attached_tensors={SMOOTHQUANT_PROFILE['attached_tensors']}, "
+            f"linear_calls={SMOOTHQUANT_PROFILE['linear_calls']}, "
+            f"loaded_tensors={SMOOTHQUANT_PROFILE['loaded_tensors']}",
+            flush=True,
+        )
 
 
 def sample(logits: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
@@ -1448,6 +1963,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--max-new-tokens", type=int, default=100)
     parser.add_argument("--temperature", type=float, default=0.6)
+    parser.add_argument(
+        "--clear-history-each-prompt",
+        action="store_true",
+        help="Treat each stdin/input prompt as an independent chat turn. Useful for calibration JSONL.",
+    )
     parser.add_argument("--dense-gpu", default="auto", help="'auto' or a physical CUDA device id")
     parser.add_argument("--gpu-ids", default="auto", help="'auto' or comma-separated physical CUDA device ids")
     parser.add_argument(
@@ -1497,9 +2017,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--gpu-quant-backend",
-        choices=("native", "int8-smoothquant"),
+        choices=("native", "int8-smoothquant", "int8-mr-gptq"),
         default="native",
-        help="GPU resident-expert backend. int8-smoothquant requires precomputed calibrated W8A8 artifacts.",
+        help="GPU resident-expert backend. INT8 modes require precomputed calibrated W8A8 artifacts.",
     )
     parser.add_argument(
         "--gpu-fp4-backend",
@@ -1522,9 +2042,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--gpu-int8-artifacts",
+        type=Path,
+        help="Directory containing the selected INT8 manifest and safetensors artifacts.",
+    )
+    parser.add_argument(
         "--gpu-smoothquant-artifacts",
         type=Path,
-        help="Directory containing smoothquant-int8-manifest.json and W8A8 safetensors artifacts.",
+        help="Legacy alias for --gpu-int8-artifacts when using int8-smoothquant.",
     )
     parser.add_argument(
         "--cpuinfer-threads",
@@ -1561,6 +2086,11 @@ def parse_args() -> argparse.Namespace:
         help="Write fallback timing, CPU MoE, placement, and routing-count profile JSON.",
     )
     parser.add_argument(
+        "--activation-stats-output",
+        type=Path,
+        help="Write per-linear input-channel activation amax JSON for offline SmoothQuant INT8 conversion.",
+    )
+    parser.add_argument(
         "--domain-routing-output",
         type=Path,
         help=(
@@ -1572,8 +2102,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    global ACTIVE_DOMAIN_TAG
+    global ACTIVE_DOMAIN_TAG, ACTIVATION_STATS_ENABLED
     args = parse_args()
+    ACTIVATION_STATS_ENABLED = args.activation_stats_output is not None
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available")
 
@@ -1621,8 +2152,15 @@ def main() -> None:
         raise RuntimeError("--gpu-fp4-backend=sm86-mxfp4 requires --torch-quant-fallback=auto or on")
     if args.gpu_fp8_backend == "sm86-fp8" and not torch_quant_fallback:
         raise RuntimeError("--gpu-fp8-backend=sm86-fp8 requires --torch-quant-fallback=auto or on")
-    if torch_quant_fallback:
-        _patch_torch_quant_fallback(model_module, args.gpu_fp4_backend, args.gpu_fp8_backend)
+    smoothquant_store: SmoothQuantArtifactStore | None = None
+    int8_artifact_dir = args.gpu_int8_artifacts or args.gpu_smoothquant_artifacts
+    if torch_quant_fallback or args.gpu_quant_backend != "native" or ACTIVATION_STATS_ENABLED:
+        _patch_torch_quant_fallback(
+            model_module,
+            args.gpu_fp4_backend,
+            args.gpu_fp8_backend,
+            enable_quant_fallback=torch_quant_fallback,
+        )
     if torch_attn_fallback:
         _patch_torch_attention_fallback(model_module)
 
@@ -1648,25 +2186,30 @@ def main() -> None:
         f"backend={args.gpu_quant_backend}, "
         f"fp4_backend={args.gpu_fp4_backend}, "
         f"fp8_backend={args.gpu_fp8_backend}, "
-        f"smoothquant_artifacts={args.gpu_smoothquant_artifacts or 'none'}, "
+        f"int8_artifacts={int8_artifact_dir or 'none'}, "
         f"int8_tensor_core_gpus={int8_tc_gpus}"
     )
-    if args.gpu_quant_backend == "int8-smoothquant":
+    if args.gpu_quant_backend != "native":
         unsupported = [gid for gid in gpu_ids if not _gpu_has_int8_tensor_cores(gid)]
         if unsupported:
-            raise RuntimeError(f"int8-smoothquant selected but GPUs lack Ampere INT8 tensor cores: {unsupported}")
-        if args.gpu_smoothquant_artifacts is None:
             raise RuntimeError(
-                "int8-smoothquant requires --gpu-smoothquant-artifacts. "
-                "Build calibrated W8A8 artifacts with kt-kernel/scripts/build_smoothquant_int8_artifacts.py."
+                f"{args.gpu_quant_backend} selected but GPUs lack Ampere INT8 tensor cores: {unsupported}"
             )
-        manifest_path = args.gpu_smoothquant_artifacts / "smoothquant-int8-manifest.json"
+        if int8_artifact_dir is None:
+            raise RuntimeError(
+                f"{args.gpu_quant_backend} requires --gpu-int8-artifacts. "
+                "Build calibrated W8A8 artifacts with kt-kernel/scripts/convert_fp8_smoothquant_int8.py."
+            )
+        expected_scheme, manifest_name = INT8_ARTIFACT_MANIFESTS[args.gpu_quant_backend]
+        manifest_path = int8_artifact_dir / manifest_name
         if not manifest_path.exists():
-            raise FileNotFoundError(f"SmoothQuant manifest not found: {manifest_path}")
-        raise RuntimeError(
-            "int8-smoothquant artifact validation passed, but the CUDA W8A8 replacement path is not wired into "
-            "the DeepSeek V4 runner yet. Use --gpu-quant-backend native for execution until the tensor-core "
-            "kernel adapter is implemented."
+            raise FileNotFoundError(f"INT8 artifact manifest not found: {manifest_path}")
+        smoothquant_store = SmoothQuantArtifactStore(manifest_path, expected_scheme=expected_scheme)
+        print(
+            "  INT8 artifacts ready: "
+            f"scheme={smoothquant_store.scheme}, "
+            f"manifest_entries={len(smoothquant_store.entries)}, manifest={manifest_path}",
+            flush=True,
         )
     print(
         "Compatibility policy: "
@@ -1717,7 +2260,20 @@ def main() -> None:
     from safetensors.torch import load_model
 
     load_model(model, str(ckpt_file), strict=False, device="cpu")
+    _annotate_parameter_names(model)
     print(f"  Done in {time.time() - started:.1f}s")
+
+    if smoothquant_store is not None:
+        print("\nAttaching INT8 artifacts...")
+        started = time.time()
+        stats = _attach_smoothquant_int8_artifacts(model, smoothquant_store)
+        print(
+            "  Attached INT8 artifacts: "
+            f"attached={stats['attached_tensors']}/{stats['manifest_entries']}, "
+            f"shape_mismatches={stats['shape_mismatches']}, "
+            f"done in {time.time() - started:.1f}s",
+            flush=True,
+        )
 
     print(f"\nPlacing dense weights for GPU {dense_gpu}...")
     started = time.time()
@@ -1796,6 +2352,8 @@ def main() -> None:
             if not prompt.strip():
                 continue
 
+            if args.clear_history_each_prompt:
+                messages.clear()
             prompt_text, domain_tag = _parse_prompt_record(prompt)
             messages.append({"role": "user", "content": prompt_text})
             prompt_tokens = tokenizer.encode(encode_messages(messages, thinking_mode="chat"))
@@ -1828,6 +2386,8 @@ def main() -> None:
                 expert_placement_strategy,
                 expert_map,
             )
+        if args.activation_stats_output is not None and rank == 0:
+            _write_activation_stats(args.activation_stats_output)
         if (
             args.domain_routing_output is not None
             and rank == 0

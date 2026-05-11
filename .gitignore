@@ -31,3 +31,5 @@ CMakeFiles/
 kvc2/
 sched/
 *.png
+.venv/
+.sindexer/

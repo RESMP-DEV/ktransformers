@@ -219,3 +219,146 @@ def test_gpu_fp8_backend_forced_mode_fails_without_extension(monkeypatch):
 
     with pytest.raises(RuntimeError, match="KTransformersOps.fp8_linear"):
         runner._select_gpu_fp8_backend("sm86-fp8", torch.device("cuda:0"), torch.device("cuda:0"))
+
+
+def test_smoothquant_artifact_store_attaches_and_runs_linear(tmp_path):
+    runner = _load_runner_module()
+    qweight = torch.tensor([[1, -2, 3], [4, 5, -6]], dtype=torch.int8)
+    weight_scale = torch.tensor([0.25, 0.5], dtype=torch.float32)
+    smooth_scale = torch.tensor([2.0, 4.0, 8.0], dtype=torch.float32)
+    manifest = tmp_path / "smoothquant-int8-manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "scheme": "w8a8_smoothquant",
+                "files": [
+                    {
+                        "artifact": str(tmp_path / "weights.smooth-int8.safetensors"),
+                        "tensors": [
+                            {
+                                "source": "model.proj.weight",
+                                "qweight": "model.proj.smooth_int8.weight",
+                                "weight_scale": "model.proj.smooth_int8.weight_scale",
+                                "smooth_scale": "model.proj.smooth_int8.smooth_scale",
+                                "shape": [2, 3],
+                            }
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    model = torch.nn.Sequential()
+    model.add_module("proj", torch.nn.Linear(3, 2, bias=False))
+    store = runner.SmoothQuantArtifactStore(manifest)
+    stats = runner._attach_smoothquant_int8_artifacts(model, store)
+    x = torch.tensor([[8.0, 4.0, 2.0]], dtype=torch.float32)
+
+    class FakeStore:
+        def tensors_for(self, entry, device):
+            del entry
+            return qweight.to(device), weight_scale.to(device), smooth_scale.to(device)
+
+    model.proj.weight._eva_smoothquant_store = FakeStore()
+    actual = runner._smoothquant_int8_linear(x, model.proj.weight, torch.float32)
+    expected = torch.nn.functional.linear(
+        x / smooth_scale.reshape(1, -1),
+        qweight.float() * weight_scale.reshape(-1, 1),
+    )
+
+    assert stats["attached_tensors"] == 1
+    torch.testing.assert_close(actual, expected)
+
+
+def test_mr_gptq_artifact_store_applies_activation_rotation(tmp_path):
+    runner = _load_runner_module()
+    qweight = torch.tensor([[2, 0], [0, 2]], dtype=torch.int8)
+    weight_scale = torch.tensor([[1.0], [1.0]], dtype=torch.float32)
+    manifest = tmp_path / "mr-gptq-int8-manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "scheme": "w8a8_mr_gptq_int8",
+                "files": [
+                    {
+                        "artifact": str(tmp_path / "weights.mr-gptq-int8.safetensors"),
+                        "tensors": [
+                            {
+                                "source": "model.proj.weight",
+                                "qweight": "model.proj.mr_gptq_int8.weight",
+                                "weight_scale": "model.proj.mr_gptq_int8.weight_scale",
+                                "rotation": {
+                                    "type": "block_hadamard",
+                                    "block_size": 2,
+                                    "normalized": True,
+                                    "tail_policy": "identity",
+                                },
+                                "shape": [2, 2],
+                            }
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    model = torch.nn.Sequential()
+    model.add_module("proj", torch.nn.Linear(2, 2, bias=False))
+    store = runner.SmoothQuantArtifactStore(manifest, expected_scheme="w8a8_mr_gptq_int8")
+    stats = runner._attach_smoothquant_int8_artifacts(model, store)
+    x = torch.tensor([[2.0**0.5, 2.0**0.5]], dtype=torch.float32)
+
+    class FakeStore:
+        scheme = "w8a8_mr_gptq_int8"
+
+        def tensors_for(self, entry, device):
+            del entry
+            return qweight.to(device), weight_scale.to(device), torch.empty(0, device=device)
+
+    model.proj.weight._eva_smoothquant_store = FakeStore()
+    model.proj.weight._eva_smoothquant_entry = store.lookup("model.proj.weight")
+    actual = runner._smoothquant_int8_linear(x, model.proj.weight, torch.float32)
+    expected = torch.nn.functional.linear(runner._apply_block_hadamard(x, 2), qweight.float())
+
+    assert stats["attached_tensors"] == 1
+    assert runner._int8_artifact_profile_name(model.proj.weight) == "linear_int8_mr_gptq"
+    torch.testing.assert_close(actual, expected)
+
+
+def test_cpu_moe_phase_profile_accumulates_named_phases():
+    runner = _load_runner_module()
+
+    runner._record_cpu_moe_phase("cpuinfer_sync", 0.25)
+    runner._record_cpu_moe_phase("cpuinfer_sync", 0.75, calls=3)
+
+    assert runner.CPU_MOE_PROFILE["phase_seconds"]["cpuinfer_sync"] == 1.0
+    assert runner.CPU_MOE_PROFILE["phase_calls"]["cpuinfer_sync"] == 4
+
+
+def test_activation_amax_records_named_linear_inputs():
+    runner = _load_runner_module()
+    runner.ACTIVATION_STATS_ENABLED = True
+    runner.ACTIVATION_AMAX.clear()
+    runner.ACTIVATION_TOKENS.clear()
+    weight = torch.nn.Parameter(torch.zeros(2, 3))
+    weight._eva_param_name = "model.layers.0.self_attn.q_proj.weight"
+
+    runner._record_activation_amax(
+        weight,
+        torch.tensor(
+            [
+                [1.0, -2.0, 3.0],
+                [-4.0, 0.5, 2.0],
+            ]
+        ),
+    )
+    runner._record_activation_amax(weight, torch.tensor([[0.25, -6.0, 1.0]]))
+
+    torch.testing.assert_close(
+        runner.ACTIVATION_AMAX["model.layers.0.self_attn.q_proj.weight"],
+        torch.tensor([4.0, 6.0, 3.0]),
+    )
+    assert runner.ACTIVATION_TOKENS["model.layers.0.self_attn.q_proj.weight"] == 3

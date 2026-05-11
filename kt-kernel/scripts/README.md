@@ -154,6 +154,107 @@ python scripts/convert_cpu_weights.py \
 
 ## GPU Weight Quantization
 
+### SM86 FP8 to INT8 Artifacts
+
+RTX 3090-class SM86 GPUs do not expose FP8 tensor cores, but they do expose
+INT8 tensor cores. For DeepSeek V4 Flash, convert FP8 dense/shared GPU weights
+offline and feed the artifacts to the multi-GPU runner instead of dequantizing
+FP8 in the decode hot path.
+
+Prepare calibration prompts. Always include Bartowski iMatrix Calibration v3;
+use the larger Pile+Bartowski mix only if the 168 V3 chunks do not cover enough
+layers/channels in the activation report:
+
+```bash
+python scripts/prepare_mr_gptq_calibration_prompts.py \
+  --output /home/kearm/AlphaHENG/agent_workspace/bartowski-v3-calibration.jsonl
+
+# Optional broader pass, still seeded by Bartowski V3:
+python scripts/prepare_mr_gptq_calibration_prompts.py \
+  --output /home/kearm/AlphaHENG/agent_workspace/bartowski-v3-plus-pile-calibration.jsonl \
+  --include-pile-v3 \
+  --max-pile-samples 512
+```
+
+First capture per-linear activation amax values with a short calibration prompt
+run. Feed the JSONL prompts on stdin so each row drives a normal chat turn:
+
+```bash
+python scripts/moe_reap_calibration_multi_gpu.py \
+  ... \
+  --max-new-tokens 1 \
+  --clear-history-each-prompt \
+  --activation-stats-output /home/kearm/AlphaHENG/agent_workspace/v4-flash-fp8-amax.json \
+  < /home/kearm/AlphaHENG/agent_workspace/bartowski-v3-calibration.jsonl
+```
+
+Then convert the FP8 tensors offline. The default is the older SmoothQuant
+layout:
+
+```bash
+python scripts/convert_fp8_smoothquant_int8.py \
+  --weights /home/kearm/AlphaHENG/models/deepseek/v4-flash-inference-mp1 \
+  --activation-stats /home/kearm/AlphaHENG/agent_workspace/v4-flash-fp8-amax.json \
+  --output-dir /home/kearm/AlphaHENG/models/deepseek/v4-flash-int8-smoothquant
+```
+
+For the MR-GPTQ-inspired path, emit block-Hadamard-rotated, group-scaled INT8
+weights with static act-order metadata:
+
+```bash
+python scripts/convert_fp8_smoothquant_int8.py \
+  --method mr-gptq \
+  --mr-rotation-block-size 128 \
+  --weights /home/kearm/AlphaHENG/models/deepseek/v4-flash-inference-mp1 \
+  --activation-stats /home/kearm/AlphaHENG/agent_workspace/v4-flash-fp8-amax.json \
+  --output-dir /home/kearm/AlphaHENG/models/deepseek/v4-flash-int8-mr-gptq
+```
+
+If a per-linear Hessian/Gram capture is available, pass it to enable the real
+GPTQ error-propagation step rather than the amax-only fallback:
+
+```bash
+python scripts/convert_fp8_smoothquant_int8.py \
+  --method mr-gptq \
+  --mr-rotation-block-size 128 \
+  --weights /home/kearm/AlphaHENG/models/deepseek/v4-flash-inference-mp1 \
+  --activation-stats /home/kearm/AlphaHENG/agent_workspace/v4-flash-fp8-amax.json \
+  --hessian-stats /home/kearm/AlphaHENG/agent_workspace/v4-flash-linear-gram.pt \
+  --output-dir /home/kearm/AlphaHENG/models/deepseek/v4-flash-int8-mr-gptq
+```
+
+Then run:
+
+```bash
+python scripts/moe_reap_calibration_multi_gpu.py \
+  ... \
+  --gpu-quant-backend int8-smoothquant \
+  --gpu-int8-artifacts /home/kearm/AlphaHENG/models/deepseek/v4-flash-int8-smoothquant
+
+python scripts/moe_reap_calibration_multi_gpu.py \
+  ... \
+  --gpu-quant-backend int8-mr-gptq \
+  --gpu-int8-artifacts /home/kearm/AlphaHENG/models/deepseek/v4-flash-int8-mr-gptq
+```
+
+The converter reads DeepSeek-style `weight_scale_inv` block scales, dequantizes
+FP8 weights once, and writes either `smoothquant-int8-manifest.json` or
+`mr-gptq-int8-manifest.json` plus safetensors. The MR-GPTQ INT8 layout stores
+rotated INT8 weights, per-row/per-rotation-group scales, activation-order
+metadata, and the block-Hadamard contract needed by the runtime. Keep this as
+an offline, quality-gated step; doing FP8-to-INT8 remap during decode trades
+away the SM86 tensor-core benefit.
+
+The INT8 path follows FP-Quant's algorithmic structure where it matters for
+SM86: block-Hadamard input rotation, optional activation-order GPTQ, group
+scales, and offline artifact export. It intentionally does not use FP-Quant's
+QuTLASS FP4 kernels. The runtime contract is instead shaped for an SM86 INT8
+tensor-core GEMM: rotate and quantize activations online, multiply by INT8
+GPTQ weights, then apply output scaling. Treat the generated manifest's
+`gptq_error_propagation` field as part of the quality report; `applied` means a
+Hessian/Gram file was used, while `not_applied_activation_amax_only` is only the
+lighter fallback.
+
 ### Prerequisites
 
 GPU weight quantization requires additional dependencies. Install them before proceeding:
